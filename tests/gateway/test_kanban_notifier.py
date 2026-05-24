@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,9 +12,13 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -41,6 +46,7 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    runner.session_store = SimpleNamespace(_entries={})
     return runner
 
 
@@ -104,6 +110,60 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+@pytest.mark.parametrize(
+    ("event_kind", "event_text", "expected_detail"),
+    [
+        ("completed", "finished the work", "finished the work"),
+        ("blocked", "waiting on input", "waiting on input"),
+    ],
+)
+def test_kanban_delivery_injects_synthetic_message_and_removes_sub(
+    event_kind, event_text, expected_detail, tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "delivery.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="deliverable", assignee="worker")
+        kb.add_delivery_sub(
+            conn,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:chat-1",
+            platform="telegram",
+            chat_id="chat-1",
+            notifier_profile="default",
+        )
+        if event_kind == "completed":
+            kb.complete_task(conn, tid, summary=event_text)
+        else:
+            kb.block_task(conn, tid, reason=event_text)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.internal is True
+    assert event.source.platform == Platform.TELEGRAM
+    assert event.source.chat_id == "chat-1"
+    assert tid in event.text
+    assert event_kind in event.text
+    assert expected_detail in event.text
+
+    conn = kb.connect()
+    try:
+        assert kb.list_delivery_subs(conn, tid) == []
+    finally:
+        conn.close()
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):

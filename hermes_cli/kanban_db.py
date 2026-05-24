@@ -935,6 +935,22 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- One-shot delivery subscription from a gateway-hosted agent session to a
+-- task. When the task emits completed/blocked, the gateway injects a
+-- synthetic MessageEvent back into the originating session instead of sending
+-- a human-facing text notification.
+CREATE TABLE IF NOT EXISTS kanban_delivery_subs (
+    task_id       TEXT NOT NULL,
+    session_key   TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    notifier_profile TEXT,
+    created_at    INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, session_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -944,6 +960,7 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_task         ON kanban_delivery_subs(task_id);
 """
 
 
@@ -1394,6 +1411,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_delivery_subs (
+            task_id       TEXT NOT NULL,
+            session_key   TEXT NOT NULL,
+            platform      TEXT NOT NULL,
+            chat_id       TEXT NOT NULL,
+            thread_id     TEXT NOT NULL DEFAULT '',
+            notifier_profile TEXT,
+            created_at    INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, session_key)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_task "
+        "ON kanban_delivery_subs(task_id)"
+    )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -3770,6 +3807,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_delivery_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -3793,6 +3831,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_delivery_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -6286,6 +6325,182 @@ def rewind_notify_cursor(
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
                 int(claimed_cursor),
             ),
+        )
+    return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Delivery subscriptions (gateway synthetic-message wakeups)
+# ---------------------------------------------------------------------------
+
+def add_delivery_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    session_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> None:
+    """Register a gateway session for one-shot agent delivery."""
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_delivery_subs
+                (task_id, session_key, platform, chat_id, thread_id,
+                 notifier_profile, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id, session_key, platform, chat_id, thread_id or "",
+                notifier_profile, now,
+            ),
+        )
+        if notifier_profile:
+            conn.execute(
+                """
+                UPDATE kanban_delivery_subs
+                   SET notifier_profile = ?
+                 WHERE task_id = ? AND session_key = ?
+                   AND (notifier_profile IS NULL OR notifier_profile = '')
+                """,
+                (notifier_profile, task_id, session_key),
+            )
+
+
+def list_delivery_subs(
+    conn: sqlite3.Connection, task_id: Optional[str] = None,
+) -> list[dict]:
+    if task_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM kanban_delivery_subs WHERE task_id = ?", (task_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM kanban_delivery_subs").fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_delivery_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    session_key: str,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_delivery_subs "
+            "WHERE task_id = ? AND session_key = ?",
+            (task_id, session_key),
+        )
+    return cur.rowcount > 0
+
+
+def unseen_delivery_events_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    session_key: str,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, list[Event]]:
+    """Return ``(new_cursor, events)`` without advancing delivery cursor."""
+    row = conn.execute(
+        "SELECT last_event_id FROM kanban_delivery_subs "
+        "WHERE task_id = ? AND session_key = ?",
+        (task_id, session_key),
+    ).fetchone()
+    if row is None:
+        return 0, []
+    cursor = int(row["last_event_id"])
+    kind_list = list(kinds) if kinds else None
+    q = (
+        "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+        + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+        + "ORDER BY id ASC"
+    )
+    params: list[Any] = [task_id, cursor]
+    if kind_list:
+        params.extend(kind_list)
+    rows = conn.execute(q, params).fetchall()
+    out: list[Event] = []
+    max_id = cursor
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else None
+        except Exception:
+            payload = None
+        out.append(Event(
+            id=r["id"], task_id=r["task_id"], kind=r["kind"],
+            payload=payload, created_at=r["created_at"],
+            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+        ))
+        max_id = max(max_id, int(r["id"]))
+    return max_id, out
+
+
+def claim_unseen_delivery_events(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    session_key: str,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen delivery events for one session subscription."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_delivery_subs "
+            "WHERE task_id = ? AND session_key = ?",
+            (task_id, session_key),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        new_cursor, events = unseen_delivery_events_for_sub(
+            conn,
+            task_id=task_id,
+            session_key=session_key,
+            kinds=kinds,
+        )
+        if not events:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_delivery_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND session_key = ? AND last_event_id = ?",
+            (int(new_cursor), task_id, session_key, int(old_cursor)),
+        )
+        return old_cursor, new_cursor, events
+
+
+def advance_delivery_cursor(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    session_key: str,
+    new_cursor: int,
+) -> None:
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_delivery_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND session_key = ?",
+            (int(new_cursor), task_id, session_key),
+        )
+
+
+def rewind_delivery_cursor(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    session_key: str,
+    claimed_cursor: int,
+    old_cursor: int,
+) -> bool:
+    """Undo a delivery claim when synthetic injection fails."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_delivery_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND session_key = ? AND last_event_id = ?",
+            (int(old_cursor), task_id, session_key, int(claimed_cursor)),
         )
     return cur.rowcount > 0
 

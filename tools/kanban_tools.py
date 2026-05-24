@@ -664,6 +664,9 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
+    delivery, bool_error = _parse_bool_arg(args, "delivery")
+    if bool_error:
+        return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -706,6 +709,26 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            if delivery:
+                try:
+                    from gateway.session_context import get_session_env
+
+                    session_key = get_session_env("HERMES_SESSION_KEY", "")
+                    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+                    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+                    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+                    if session_key and platform and chat_id:
+                        kb.add_delivery_sub(
+                            conn,
+                            task_id=new_tid,
+                            session_key=session_key,
+                            platform=platform,
+                            chat_id=chat_id,
+                            thread_id=thread_id or "",
+                            notifier_profile=os.environ.get("HERMES_PROFILE"),
+                        )
+                except Exception:
+                    logger.debug("kanban_create delivery registration failed", exc_info=True)
             new_task = kb.get_task(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1164,6 +1187,15 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "delivery": {
+                "type": "boolean",
+                "description": (
+                    "When true from a gateway-hosted agent session, "
+                    "inject a synthetic message back into this session "
+                    "when the task completes or blocks so the agent can "
+                    "continue through the normal platform reply flow."
                 ),
             },
             "board": _board_schema_prop(),

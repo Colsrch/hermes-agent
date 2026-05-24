@@ -4633,6 +4633,7 @@ class GatewayRunner:
             return
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        DELIVERY_KINDS = ("completed", "blocked")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4757,12 +4758,60 @@ class GatewayRunner:
                                     "task": task,
                                     "board": slug,
                                 })
+                            try:
+                                dsubs = _kb.list_delivery_subs(conn)
+                            except Exception as exc:
+                                logger.debug(
+                                    "kanban notifier: cannot list delivery subscriptions on board %s: %s",
+                                    slug, exc,
+                                )
+                                dsubs = []
+                            for dsub in dsubs:
+                                owner_profile = dsub.get("notifier_profile") or None
+                                if owner_profile and owner_profile != notifier_profile:
+                                    logger.debug(
+                                        "kanban notifier: delivery subscription for %s owned by profile %s; current profile %s skipping",
+                                        dsub.get("task_id"), owner_profile, notifier_profile,
+                                    )
+                                    continue
+                                platform = (dsub.get("platform") or "").lower()
+                                if platform not in active_platforms:
+                                    logger.debug(
+                                        "kanban notifier: delivery subscription for %s on %s skipped; adapter not connected",
+                                        dsub.get("task_id"), platform or "<missing>",
+                                    )
+                                    continue
+                                old_cursor, cursor, events = _kb.claim_unseen_delivery_events(
+                                    conn,
+                                    task_id=dsub["task_id"],
+                                    session_key=dsub["session_key"],
+                                    kinds=DELIVERY_KINDS,
+                                )
+                                if not events:
+                                    continue
+                                task = _kb.get_task(conn, dsub["task_id"])
+                                logger.debug(
+                                    "kanban notifier: claimed %d delivery event(s) for %s on board %s cursor %s->%s",
+                                    len(events), dsub["task_id"], slug, old_cursor, cursor,
+                                )
+                                deliveries.append({
+                                    "sub": dsub,
+                                    "old_cursor": old_cursor,
+                                    "cursor": cursor,
+                                    "events": events,
+                                    "task": task,
+                                    "board": slug,
+                                    "is_delivery": True,
+                                })
                         finally:
                             conn.close()
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
+                    if d.get("is_delivery"):
+                        await self._handle_kanban_delivery(d)
+                        continue
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
@@ -4997,6 +5046,184 @@ class GatewayRunner:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    async def _handle_kanban_delivery(self, delivery: dict) -> None:
+        """Inject a kanban terminal event into the originating agent session."""
+        from gateway.config import Platform as _Platform
+
+        dsub = delivery["sub"]
+        task = delivery.get("task")
+        board_slug = delivery.get("board")
+        platform_str = (dsub.get("platform") or "").lower()
+
+        try:
+            platform = _Platform(platform_str)
+        except ValueError:
+            await asyncio.to_thread(
+                self._kanban_delivery_advance, dsub, delivery["cursor"], board_slug,
+            )
+            await asyncio.to_thread(self._kanban_delivery_remove, dsub, board_slug)
+            return
+
+        adapter = self.adapters.get(platform)
+        if adapter is None:
+            logger.debug(
+                "kanban notifier: adapter %s disconnected before delivery injection for %s; rewinding claim",
+                platform_str, dsub["task_id"],
+            )
+            await asyncio.to_thread(
+                self._kanban_delivery_rewind,
+                dsub,
+                delivery["cursor"],
+                delivery.get("old_cursor", 0),
+                board_slug,
+            )
+            return
+
+        source = self._source_for_kanban_delivery(dsub, platform)
+        if source is None:
+            logger.warning(
+                "kanban notifier: dropping delivery for %s; no source metadata",
+                dsub.get("task_id"),
+            )
+            await asyncio.to_thread(
+                self._kanban_delivery_advance, dsub, delivery["cursor"], board_slug,
+            )
+            await asyncio.to_thread(self._kanban_delivery_remove, dsub, board_slug)
+            return
+
+        for event in delivery["events"]:
+            text = self._kanban_delivery_text(dsub, task, event)
+            if not text:
+                continue
+            try:
+                synthetic_event = MessageEvent(
+                    text=text,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                    message_id=getattr(source, "message_id", None),
+                )
+                await adapter.handle_message(synthetic_event)
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: delivery injection failed for %s: %s",
+                    dsub.get("task_id"), exc,
+                )
+                await asyncio.to_thread(
+                    self._kanban_delivery_rewind,
+                    dsub,
+                    delivery["cursor"],
+                    delivery.get("old_cursor", 0),
+                    board_slug,
+                )
+                return
+
+        await asyncio.to_thread(
+            self._kanban_delivery_advance, dsub, delivery["cursor"], board_slug,
+        )
+        await asyncio.to_thread(self._kanban_delivery_remove, dsub, board_slug)
+
+    def _source_for_kanban_delivery(self, dsub: dict, platform) -> Optional[SessionSource]:
+        session_key = dsub.get("session_key")
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                ensure_loaded = getattr(store, "_ensure_loaded", None)
+                if callable(ensure_loaded):
+                    ensure_loaded()
+                entry = getattr(store, "_entries", {}).get(session_key)
+                if entry and entry.origin:
+                    return entry.origin
+            except Exception:
+                logger.debug("kanban notifier: session-store lookup failed", exc_info=True)
+
+        chat_id = str(dsub.get("chat_id") or "").strip()
+        if not chat_id:
+            return None
+        thread_id = str(dsub.get("thread_id") or "").strip() or None
+        return SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="thread" if thread_id else "dm",
+            user_id="system:kanban-delivery",
+            user_name="Kanban",
+            thread_id=thread_id,
+        )
+
+    def _kanban_delivery_text(self, dsub: dict, task, event) -> str:
+        title = (task.title if task else dsub.get("task_id", ""))[:120]
+        task_id = dsub.get("task_id", "")
+        if event.kind == "completed":
+            summary = ""
+            if event.payload and event.payload.get("summary"):
+                summary = str(event.payload["summary"]).strip()
+            elif task and task.result:
+                summary = str(task.result).strip()
+            summary = summary[:500] if summary else "(no summary provided)"
+            return (
+                f"[Kanban task {task_id} completed - {title}.\n"
+                f"Summary: {summary}]"
+            )
+        if event.kind == "blocked":
+            reason = ""
+            if event.payload and event.payload.get("reason"):
+                reason = str(event.payload["reason"]).strip()
+            reason = reason[:300] if reason else "(no reason given)"
+            return (
+                f"[Kanban task {task_id} blocked - {title}.\n"
+                f"Reason: {reason}]"
+            )
+        return ""
+
+    def _kanban_delivery_advance(
+        self, dsub: dict, cursor: int, board: Optional[str] = None,
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.advance_delivery_cursor(
+                conn,
+                task_id=dsub["task_id"],
+                session_key=dsub["session_key"],
+                new_cursor=cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_delivery_rewind(
+        self,
+        dsub: dict,
+        claimed_cursor: int,
+        old_cursor: int,
+        board: Optional[str] = None,
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.rewind_delivery_cursor(
+                conn,
+                task_id=dsub["task_id"],
+                session_key=dsub["session_key"],
+                claimed_cursor=claimed_cursor,
+                old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_delivery_remove(
+        self, dsub: dict, board: Optional[str] = None,
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.remove_delivery_sub(
+                conn,
+                task_id=dsub["task_id"],
+                session_key=dsub["session_key"],
             )
         finally:
             conn.close()

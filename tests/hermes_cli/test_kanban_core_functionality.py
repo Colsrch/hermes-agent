@@ -621,6 +621,86 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         conn2.close()
 
 
+def test_delivery_sub_crud_and_cursor(kanban_home):
+    conn1 = kb.connect()
+    conn2 = kb.connect()
+    try:
+        tid = kb.create_task(conn1, title="delivery", assignee="w")
+        kb.add_delivery_sub(
+            conn1,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="123",
+            thread_id="topic-1",
+            notifier_profile="default",
+        )
+        kb.add_delivery_sub(
+            conn1,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="123",
+            thread_id="topic-1",
+            notifier_profile="default",
+        )
+        subs = kb.list_delivery_subs(conn1, tid)
+        assert len(subs) == 1
+        assert subs[0]["session_key"] == "agent:main:telegram:dm:123"
+        assert subs[0]["thread_id"] == "topic-1"
+        assert subs[0]["notifier_profile"] == "default"
+
+        kb.complete_task(conn1, tid, result="ok", summary="delivery summary")
+        old_cursor, claimed_cursor, events = kb.claim_unseen_delivery_events(
+            conn1,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            kinds=["completed", "blocked"],
+        )
+        assert old_cursor == 0
+        assert claimed_cursor > old_cursor
+        assert [ev.kind for ev in events] == ["completed"]
+
+        _, _, duplicate_events = kb.claim_unseen_delivery_events(
+            conn2,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            kinds=["completed", "blocked"],
+        )
+        assert duplicate_events == []
+
+        assert kb.rewind_delivery_cursor(
+            conn1,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            claimed_cursor=claimed_cursor,
+            old_cursor=old_cursor,
+        ) is True
+
+        old_cursor, claimed_cursor, events = kb.claim_unseen_delivery_events(
+            conn2,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            kinds=["completed", "blocked"],
+        )
+        assert [ev.kind for ev in events] == ["completed"]
+        kb.advance_delivery_cursor(
+            conn2,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            new_cursor=claimed_cursor,
+        )
+        assert kb.remove_delivery_sub(
+            conn2,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+        ) is True
+        assert kb.list_delivery_subs(conn1, tid) == []
+    finally:
+        conn1.close()
+        conn2.close()
+
+
 # ---------------------------------------------------------------------------
 # GC + retention
 # ---------------------------------------------------------------------------
