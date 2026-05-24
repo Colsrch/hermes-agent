@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,17 +72,56 @@ def _require_boto3():
         )
 
 
+def resolve_bedrock_bearer_token(env: Optional[Dict[str, str]] = None) -> str:
+    """Return the configured Bedrock Runtime bearer token, if any."""
+    consult_hermes_env = env is None
+    env = env if env is not None else os.environ
+    return _aws_env_value(
+        "AWS_BEARER_TOKEN_BEDROCK",
+        env,
+        consult_hermes_env=consult_hermes_env,
+    )
+
+
+def _runtime_client_cache_key(region: str, bearer_token: str = "") -> str:
+    if not bearer_token:
+        return region
+    fingerprint = hashlib.sha256(bearer_token.encode()).hexdigest()[:16]
+    return f"{region}|bearer|{fingerprint}"
+
+
+def _register_bedrock_bearer_auth(client: Any, bearer_token: str) -> None:
+    def _add_bearer_header(params, **_kwargs):
+        headers = params.setdefault("headers", {})
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    for operation in ("Converse", "ConverseStream"):
+        client.meta.events.register(
+            f"before-call.bedrock-runtime.{operation}",
+            _add_bearer_header,
+        )
+
+
 def _get_bedrock_runtime_client(region: str):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    if region not in _bedrock_runtime_client_cache:
+    bearer_token = resolve_bedrock_bearer_token()
+    cache_key = _runtime_client_cache_key(region, bearer_token)
+    if cache_key not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
-        )
-    return _bedrock_runtime_client_cache[region]
+        kwargs = {"region_name": region}
+        if bearer_token:
+            from botocore import UNSIGNED
+            from botocore.config import Config
+
+            kwargs["config"] = Config(signature_version=UNSIGNED)
+        client = boto3.client("bedrock-runtime", **kwargs)
+        if bearer_token:
+            _register_bedrock_bearer_auth(client, bearer_token)
+        _bedrock_runtime_client_cache[cache_key] = client
+    return _bedrock_runtime_client_cache[cache_key]
 
 
 def _get_bedrock_control_client(region: str):
@@ -111,8 +151,13 @@ def invalidate_runtime_client(region: str) -> bool:
     Returns True if a cached entry was evicted, False if the region was not
     cached.
     """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
+    keys = [
+        key for key in _bedrock_runtime_client_cache
+        if key == region or key.startswith(f"{region}|")
+    ]
+    existed = bool(keys)
+    for key in keys:
+        _bedrock_runtime_client_cache.pop(key, None)
     return existed
 
 

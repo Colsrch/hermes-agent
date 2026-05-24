@@ -224,6 +224,37 @@ class TestConfigAwareBedrockRegion:
             assert bedrock_model_ids_or_none() == ["us.amazon.nova-pro-v1:0"]
 
 
+class TestBedrockBearerRuntimeClient:
+    def test_bearer_token_client_uses_unsigned_config_and_auth_header(self, monkeypatch):
+        from agent.bedrock_adapter import _get_bedrock_runtime_client, reset_client_cache
+        from botocore import UNSIGNED
+
+        reset_client_cache()
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-runtime-token")
+
+        fake_client = MagicMock()
+        fake_client.meta.events.register = MagicMock()
+        fake_boto3 = MagicMock()
+        fake_boto3.client.return_value = fake_client
+
+        with patch("agent.bedrock_adapter._require_boto3", return_value=fake_boto3):
+            assert _get_bedrock_runtime_client("us-east-1") is fake_client
+
+        _, kwargs = fake_boto3.client.call_args
+        assert kwargs["region_name"] == "us-east-1"
+        assert kwargs["config"].signature_version is UNSIGNED
+
+        registered = fake_client.meta.events.register.call_args_list
+        event_names = [call.args[0] for call in registered]
+        assert "before-call.bedrock-runtime.Converse" in event_names
+        assert "before-call.bedrock-runtime.ConverseStream" in event_names
+
+        handler = registered[0].args[1]
+        params = {"headers": {}}
+        handler(params=params)
+        assert params["headers"]["Authorization"] == "Bearer bedrock-runtime-token"
+
+
 # ---------------------------------------------------------------------------
 # Tool conversion
 # ---------------------------------------------------------------------------
@@ -1444,7 +1475,7 @@ class TestCallConverseInvalidatesOnStaleError:
     boto3 call raises a stale-connection error — so the next invocation
     reconnects instead of reusing the dead socket."""
 
-    def test_converse_evicts_client_on_stale_error(self):
+    def test_converse_evicts_client_on_stale_error(self, monkeypatch):
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
         from agent.bedrock_adapter import (
             _bedrock_runtime_client_cache,
@@ -1453,6 +1484,7 @@ class TestCallConverseInvalidatesOnStaleError:
         )
         from botocore.exceptions import ConnectionClosedError
 
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         reset_client_cache()
         dead_client = MagicMock()
         dead_client.converse.side_effect = ConnectionClosedError(
@@ -1471,7 +1503,7 @@ class TestCallConverseInvalidatesOnStaleError:
             "stale client should have been evicted so the retry reconnects"
         )
 
-    def test_converse_stream_evicts_client_on_stale_error(self):
+    def test_converse_stream_evicts_client_on_stale_error(self, monkeypatch):
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
         from agent.bedrock_adapter import (
             _bedrock_runtime_client_cache,
@@ -1480,6 +1512,7 @@ class TestCallConverseInvalidatesOnStaleError:
         )
         from botocore.exceptions import ConnectionClosedError
 
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         reset_client_cache()
         dead_client = MagicMock()
         dead_client.converse_stream.side_effect = ConnectionClosedError(
@@ -1496,7 +1529,7 @@ class TestCallConverseInvalidatesOnStaleError:
 
         assert "us-east-1" not in _bedrock_runtime_client_cache
 
-    def test_converse_does_not_evict_on_non_stale_error(self):
+    def test_converse_does_not_evict_on_non_stale_error(self, monkeypatch):
         """Non-stale errors (e.g. ValidationException) leave the client cache alone."""
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
         from agent.bedrock_adapter import (
@@ -1506,6 +1539,7 @@ class TestCallConverseInvalidatesOnStaleError:
         )
         from botocore.exceptions import ClientError
 
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         reset_client_cache()
         live_client = MagicMock()
         live_client.converse.side_effect = ClientError(
@@ -1525,13 +1559,14 @@ class TestCallConverseInvalidatesOnStaleError:
             "validation errors do not indicate a dead connection — keep the client"
         )
 
-    def test_converse_leaves_successful_client_in_cache(self):
+    def test_converse_leaves_successful_client_in_cache(self, monkeypatch):
         from agent.bedrock_adapter import (
             _bedrock_runtime_client_cache,
             call_converse,
             reset_client_cache,
         )
 
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         reset_client_cache()
         live_client = MagicMock()
         live_client.converse.return_value = {
