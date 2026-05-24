@@ -623,20 +623,52 @@ class TestAuxiliaryClientBedrockResolution:
         assert client.api_key == "aws-sdk"
         assert "us-west-2" in client.base_url
 
-    def test_bedrock_bearer_only_does_not_build_anthropic_client(self, monkeypatch):
-        """Bearer-only Bedrock auth cannot back the AnthropicBedrock client."""
+    def test_bedrock_bearer_only_uses_converse_auxiliary_client(self, monkeypatch):
+        """Bearer-only Bedrock auth should use Converse, not AnthropicBedrock."""
         for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"]:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-runtime-token")
 
-        with patch("agent.anthropic_adapter.build_anthropic_bedrock_client") as build_client:
-            from agent.auxiliary_client import resolve_provider_client
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("agent.anthropic_adapter.build_anthropic_bedrock_client") as build_client:
+            from agent.auxiliary_client import (
+                BedrockConverseAuxiliaryClient,
+                resolve_provider_client,
+            )
 
             client, model = resolve_provider_client("bedrock", None)
 
-        assert client is None
-        assert model is None
+        assert isinstance(client, BedrockConverseAuxiliaryClient)
+        assert model is not None
+        assert client.api_key == "AWS_BEARER_TOKEN_BEDROCK"
+        assert "bedrock-runtime.us-east-1.amazonaws.com" in client.base_url
         build_client.assert_not_called()
+
+    def test_bedrock_converse_auxiliary_create_calls_converse(self, monkeypatch):
+        for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"]:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-runtime-token")
+
+        fake_response = MagicMock()
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("agent.bedrock_adapter.call_converse", return_value=fake_response) as call_converse:
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client("bedrock", "anthropic.claude-haiku-4-5-20251001-v1:0")
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=128,
+            )
+
+        assert response is fake_response
+        call_converse.assert_called_once()
+        _, kwargs = call_converse.call_args
+        assert kwargs["region"] == "us-east-1"
+        assert kwargs["model"] == "anthropic.claude-haiku-4-5-20251001-v1:0"
+        assert kwargs["max_tokens"] == 128
 
     def test_bedrock_returns_none_without_credentials(self, monkeypatch):
         """Without AWS credentials, Bedrock should return (None, None) gracefully."""
