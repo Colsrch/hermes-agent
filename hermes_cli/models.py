@@ -3690,8 +3690,11 @@ def validate_requested_model(
     # AWS SDK control plane (ListFoundationModels + ListInferenceProfiles).
     if normalized == "bedrock":
         try:
-            from agent.bedrock_adapter import discover_bedrock_models, resolve_bedrock_region
-            region = resolve_bedrock_region()
+            from agent.bedrock_adapter import (
+                discover_bedrock_models,
+                resolve_configured_bedrock_region,
+            )
+            region = resolve_configured_bedrock_region()
             discovered = discover_bedrock_models(region)
             discovered_ids = {m["id"] for m in discovered}
             if requested in discovered_ids:

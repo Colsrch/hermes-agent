@@ -5387,7 +5387,7 @@ def _model_flow_bedrock(config, current_model=""):
         from agent.bedrock_adapter import (
             has_aws_credentials,
             resolve_aws_auth_env_var,
-            resolve_bedrock_region,
+            resolve_configured_bedrock_region,
             discover_bedrock_models,
         )
     except ImportError:
@@ -5409,7 +5409,7 @@ def _model_flow_bedrock(config, current_model=""):
     print()
 
     # 2. Region selection
-    current_region = resolve_bedrock_region()
+    current_region = resolve_configured_bedrock_region()
     try:
         region_input = input(f"  AWS Region [{current_region}]: ").strip()
     except (KeyboardInterrupt, EOFError):

@@ -2178,6 +2178,13 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "AWS_BEARER_TOKEN_BEDROCK": {
+        "description": "AWS Bedrock Runtime API key / bearer token",
+        "prompt": "AWS Bedrock API Key",
+        "url": "https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys-use.html",
+        "password": True,
+        "category": "provider",
+    },
     "AWS_REGION": {
         "description": "AWS region for Bedrock API calls (e.g. us-east-1, eu-central-1)",
         "prompt": "AWS Region",

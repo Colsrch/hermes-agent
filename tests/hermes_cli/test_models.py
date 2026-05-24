@@ -44,6 +44,38 @@ class TestModelIds:
         assert len(ids) == len(set(ids)), "Duplicate model IDs found"
 
 
+class TestBedrockModels:
+    def test_validate_requested_model_uses_config_region_over_env(self, monkeypatch):
+        from hermes_cli.models import validate_requested_model
+
+        monkeypatch.setenv("AWS_REGION", "us-west-1")
+        seen_regions = []
+
+        def fake_discover(region):
+            seen_regions.append(region)
+            return [{"id": "us.amazon.nova-pro-v1:0"}]
+
+        with patch("hermes_cli.models.fetch_api_models", return_value=None), \
+             patch(
+                 "hermes_cli.config.load_config",
+                 return_value={"bedrock": {"region": "us-east-1"}},
+             ), \
+             patch(
+                 "agent.bedrock_adapter.discover_bedrock_models",
+                 side_effect=fake_discover,
+             ):
+            result = validate_requested_model(
+                "us.amazon.nova-pro-v1:0",
+                "bedrock",
+                api_key="aws-sdk",
+                base_url="https://bedrock-runtime.us-west-1.amazonaws.com",
+            )
+
+        assert result["accepted"] is True
+        assert result["recognized"] is True
+        assert seen_regions == ["us-east-1"]
+
+
 
 
 

@@ -228,6 +228,32 @@ _AWS_CREDENTIAL_ENV_VARS = [
 ]
 
 
+def _hermes_env_value(name: str) -> str:
+    """Read a value from Hermes-managed .env and mirror it for AWS SDKs.
+
+    AWS SDK credential providers read process environment variables directly.
+    Some Hermes entrypoints also use ``get_env_value()`` as their source of
+    truth, so this keeps Bedrock credential detection and boto3's credential
+    chain aligned when a credential only exists in ``~/.hermes/.env``.
+    """
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = str(get_env_value(name) or "").strip()
+    except Exception:
+        return ""
+    if value and not os.environ.get(name):
+        os.environ[name] = value
+    return value
+
+
+def _aws_env_value(name: str, env: Dict[str, str], *, consult_hermes_env: bool) -> str:
+    value = str(env.get(name, "") or "").strip()
+    if value or not consult_hermes_env:
+        return value
+    return _hermes_env_value(name)
+
+
 def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Return the name of the AWS auth source that is active, or None.
 
@@ -238,22 +264,29 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     whether the user has any AWS credentials configured without actually
     attempting to authenticate.
     """
+    consult_hermes_env = env is None
     env = env if env is not None else os.environ
     # Bearer token takes highest priority
-    if env.get("AWS_BEARER_TOKEN_BEDROCK", "").strip():
+    if _aws_env_value("AWS_BEARER_TOKEN_BEDROCK", env, consult_hermes_env=consult_hermes_env):
         return "AWS_BEARER_TOKEN_BEDROCK"
     # Explicit access key pair
-    if (env.get("AWS_ACCESS_KEY_ID", "").strip()
-            and env.get("AWS_SECRET_ACCESS_KEY", "").strip()):
+    if (
+        _aws_env_value("AWS_ACCESS_KEY_ID", env, consult_hermes_env=consult_hermes_env)
+        and _aws_env_value("AWS_SECRET_ACCESS_KEY", env, consult_hermes_env=consult_hermes_env)
+    ):
         return "AWS_ACCESS_KEY_ID"
     # Named profile (SSO, assume-role, etc.)
-    if env.get("AWS_PROFILE", "").strip():
+    if _aws_env_value("AWS_PROFILE", env, consult_hermes_env=consult_hermes_env):
         return "AWS_PROFILE"
     # Container credentials (ECS, CodeBuild)
-    if env.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "").strip():
+    if _aws_env_value(
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        env,
+        consult_hermes_env=consult_hermes_env,
+    ):
         return "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
     # Web identity (EKS IRSA)
-    if env.get("AWS_WEB_IDENTITY_TOKEN_FILE", "").strip():
+    if _aws_env_value("AWS_WEB_IDENTITY_TOKEN_FILE", env, consult_hermes_env=consult_hermes_env):
         return "AWS_WEB_IDENTITY_TOKEN_FILE"
     # No env vars — check if boto3 can resolve credentials via IMDS or other
     # implicit sources (EC2 instance role, ECS task role, Lambda, etc.)
@@ -301,24 +334,31 @@ def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
     return False
 
 
-def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
+def resolve_bedrock_region(
+    env: Optional[Dict[str, str]] = None,
+    config_region: Optional[str] = None,
+) -> str:
     """Resolve the AWS region for Bedrock API calls.
 
     Priority:
-      1. AWS_REGION env var
-      2. AWS_DEFAULT_REGION env var
-      3. boto3/botocore configured region (from ~/.aws/config or SSO profile)
-      4. us-east-1 (hard fallback)
+      1. config.yaml bedrock.region
+      2. AWS_REGION env var
+      3. AWS_DEFAULT_REGION env var
+      4. boto3/botocore configured region (from ~/.aws/config or SSO profile)
+      5. us-east-1 (hard fallback)
 
     The boto3 fallback is critical for EU/AP users who configure their region
     in ~/.aws/config via a named profile rather than env vars — without it,
     live model discovery would always return us.* profile IDs regardless of
     the user's actual region.
     """
+    if config_region and config_region.strip():
+        return config_region.strip()
+    consult_hermes_env = env is None
     env = env if env is not None else os.environ
     explicit = (
-        env.get("AWS_REGION", "").strip()
-        or env.get("AWS_DEFAULT_REGION", "").strip()
+        _aws_env_value("AWS_REGION", env, consult_hermes_env=consult_hermes_env)
+        or _aws_env_value("AWS_DEFAULT_REGION", env, consult_hermes_env=consult_hermes_env)
     )
     if explicit:
         return explicit
@@ -330,6 +370,21 @@ def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     except Exception:
         pass
     return "us-east-1"
+
+
+def resolve_configured_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
+    """Resolve Bedrock region with ``config.yaml`` overrides applied."""
+    config_region = None
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        bedrock_cfg = cfg.get("bedrock", {}) if isinstance(cfg, dict) else {}
+        if isinstance(bedrock_cfg, dict):
+            config_region = bedrock_cfg.get("region")
+    except Exception:
+        config_region = None
+    return resolve_bedrock_region(env=env, config_region=config_region)
 
 
 def bedrock_model_ids_or_none() -> Optional[List[str]]:
@@ -344,7 +399,7 @@ def bedrock_model_ids_or_none() -> Optional[List[str]]:
     ``list_authenticated_providers`` section 2, and section 3.
     """
     try:
-        discovered = discover_bedrock_models(resolve_bedrock_region())
+        discovered = discover_bedrock_models(resolve_configured_bedrock_region())
         if discovered:
             return [m["id"] for m in discovered]
     except Exception:

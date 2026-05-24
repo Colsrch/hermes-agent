@@ -52,6 +52,26 @@ def test_project_env_is_sanitized_before_loading(tmp_path, monkeypatch):
     assert os.getenv("ANTHROPIC_API_KEY") == "sk-ant-test123"
 
 
+def test_bedrock_bearer_token_is_known_for_concat_sanitizer(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    env_file = home / ".env"
+    env_file.write_text(
+        "OPENAI_API_KEY=sk-test"
+        "AWS_BEARER_TOKEN_BEDROCK=bedrock-runtime-token\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [env_file]
+    assert os.getenv("OPENAI_API_KEY") == "sk-test"
+    assert os.getenv("AWS_BEARER_TOKEN_BEDROCK") == "bedrock-runtime-token"
+
+
 def test_user_env_takes_precedence_over_project_env(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()

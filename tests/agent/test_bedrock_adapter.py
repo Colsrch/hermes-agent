@@ -13,6 +13,7 @@ import json
 import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -100,6 +101,28 @@ class TestResolveAwsAuthEnvVar:
             _bs.get_session = MagicMock(return_value=mock_session)
             assert resolve_aws_auth_env_var(env) is None
 
+    def test_reads_bearer_token_from_hermes_env_file(self, monkeypatch):
+        from agent.bedrock_adapter import resolve_aws_auth_env_var
+        from hermes_cli.config import invalidate_env_cache
+
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        home = Path(os.environ["HERMES_HOME"])
+        (home / ".env").write_text(
+            "AWS_BEARER_TOKEN_BEDROCK=bedrock-runtime-token\n",
+            encoding="utf-8",
+        )
+        invalidate_env_cache()
+
+        mock_session = MagicMock()
+        mock_session.get_credentials.return_value = None
+        with patch.dict("sys.modules", {"botocore": MagicMock(), "botocore.session": MagicMock()}):
+            import botocore.session as _bs
+            _bs.get_session = MagicMock(return_value=mock_session)
+            assert resolve_aws_auth_env_var() == "AWS_BEARER_TOKEN_BEDROCK"
+
 
 class TestHasAwsCredentials:
     def test_true_with_profile(self):
@@ -117,6 +140,11 @@ class TestHasAwsCredentials:
 
 
 class TestResolveBedrocRegion:
+    def test_prefers_config_region_over_env(self):
+        from agent.bedrock_adapter import resolve_bedrock_region
+        env = {"AWS_REGION": "us-west-1", "AWS_DEFAULT_REGION": "us-west-2"}
+        assert resolve_bedrock_region(env, config_region="us-east-1") == "us-east-1"
+
     def test_prefers_aws_region(self):
         from agent.bedrock_adapter import resolve_bedrock_region
         env = {"AWS_REGION": "eu-west-1", "AWS_DEFAULT_REGION": "us-west-2"}
@@ -148,6 +176,52 @@ class TestResolveBedrocRegion:
         from unittest.mock import patch
         with _mock_botocore_session(side_effect=Exception("no botocore")):
             assert resolve_bedrock_region({}) == "us-east-1"
+
+    def test_reads_region_from_hermes_env_file(self, monkeypatch):
+        from agent.bedrock_adapter import resolve_bedrock_region
+        from hermes_cli.config import invalidate_env_cache
+
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+        home = Path(os.environ["HERMES_HOME"])
+        (home / ".env").write_text("AWS_REGION=eu-west-1\n", encoding="utf-8")
+        invalidate_env_cache()
+
+        mock_session = MagicMock()
+        mock_session.get_config_variable.return_value = None
+        with _mock_botocore_session(return_value=mock_session):
+            assert resolve_bedrock_region() == "eu-west-1"
+
+
+class TestConfigAwareBedrockRegion:
+    def test_resolves_config_region_over_env(self, monkeypatch):
+        from agent.bedrock_adapter import resolve_configured_bedrock_region
+
+        monkeypatch.setenv("AWS_REGION", "us-west-1")
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"bedrock": {"region": "us-east-1"}},
+        ):
+            assert resolve_configured_bedrock_region() == "us-east-1"
+
+    def test_bedrock_model_ids_use_config_region_over_env(self, monkeypatch):
+        from agent.bedrock_adapter import bedrock_model_ids_or_none
+
+        monkeypatch.setenv("AWS_REGION", "us-west-1")
+
+        def fake_discover(region):
+            assert region == "us-east-1"
+            return [{"id": "us.amazon.nova-pro-v1:0"}]
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"bedrock": {"region": "us-east-1"}},
+        ), patch(
+            "agent.bedrock_adapter.discover_bedrock_models",
+            side_effect=fake_discover,
+        ):
+            assert bedrock_model_ids_or_none() == ["us.amazon.nova-pro-v1:0"]
 
 
 # ---------------------------------------------------------------------------
