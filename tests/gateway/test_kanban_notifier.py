@@ -133,6 +133,8 @@ def test_kanban_notifier_disables_disk_io_board_without_retrying(
 
     def _connect(*args, **kwargs):
         calls["connect"] += 1
+        (db_path.with_name(db_path.name + "-wal")).write_text(str(calls["connect"]))
+        (db_path.with_name(db_path.name + "-shm")).write_text(str(calls["connect"]))
         raise sqlite3.OperationalError("disk I/O error")
 
     async def _to_thread(fn, *args, **kwargs):

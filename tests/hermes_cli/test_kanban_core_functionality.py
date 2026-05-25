@@ -4017,6 +4017,8 @@ def test_gateway_dispatcher_disables_disk_io_board_without_traceback(
 
     def _dispatch_once(*args, **kwargs):
         calls["dispatch"] += 1
+        db.with_name(db.name + "-wal").write_text(str(calls["dispatch"]))
+        db.with_name(db.name + "-shm").write_text(str(calls["dispatch"]))
         raise sqlite3.OperationalError("disk I/O error")
 
     async def _to_thread(fn, *args, **kwargs):

@@ -4660,7 +4660,7 @@ class GatewayRunner:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
-        BoardFingerprint = tuple[tuple[str, int | None, int | None], ...]
+        BoardFingerprint = tuple[tuple[str, int | None, int | None, int | None], ...]
         disabled_db_boards: dict[str, BoardFingerprint] = getattr(
             self, "_kanban_notifier_disabled_db_boards", {}
         )
@@ -4668,24 +4668,15 @@ class GatewayRunner:
 
         def _board_db_fingerprint(slug: str) -> BoardFingerprint:
             path = _kb.kanban_db_path(slug)
-            paths = [
-                path,
-                path.with_name(path.name + "-wal"),
-                path.with_name(path.name + "-shm"),
-            ]
-            parts: list[tuple[str, int | None, int | None]] = []
-            for item in paths:
-                try:
-                    resolved = str(item.expanduser().resolve())
-                except Exception:
-                    resolved = str(item)
-                try:
-                    stat = item.stat()
-                except OSError:
-                    parts.append((resolved, None, None))
-                else:
-                    parts.append((resolved, stat.st_mtime_ns, stat.st_size))
-            return tuple(parts)
+            try:
+                resolved = str(path.expanduser().resolve())
+            except Exception:
+                resolved = str(path)
+            try:
+                stat = path.stat()
+            except OSError:
+                return ((resolved, None, None, None),)
+            return ((resolved, stat.st_ino, stat.st_mtime_ns, stat.st_size),)
 
         def _fingerprint_db_path(fingerprint: BoardFingerprint) -> str:
             if fingerprint:
@@ -4721,7 +4712,7 @@ class GatewayRunner:
                 logger.error(
                     "kanban notifier: board %s database %s returned disk I/O "
                     "error; disabling notifications for this board until the "
-                    "DB/WAL files change or the gateway restarts. Check disk "
+                    "DB file changes or the gateway restarts. Check disk "
                     "space, filesystem permissions, WAL sidecars, or restore "
                     "the board from backup.",
                     slug,
@@ -5573,29 +5564,20 @@ class GatewayRunner:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        BoardFingerprint = tuple[tuple[str, int | None, int | None], ...]
+        BoardFingerprint = tuple[tuple[str, int | None, int | None, int | None], ...]
         disabled_corrupt_boards: dict[str, BoardFingerprint] = {}
 
         def _board_db_fingerprint(slug: str) -> BoardFingerprint:
             path = _kb.kanban_db_path(slug)
-            paths = [
-                path,
-                path.with_name(path.name + "-wal"),
-                path.with_name(path.name + "-shm"),
-            ]
-            parts: list[tuple[str, int | None, int | None]] = []
-            for item in paths:
-                try:
-                    resolved = str(item.expanduser().resolve())
-                except Exception:
-                    resolved = str(item)
-                try:
-                    stat = item.stat()
-                except OSError:
-                    parts.append((resolved, None, None))
-                else:
-                    parts.append((resolved, stat.st_mtime_ns, stat.st_size))
-            return tuple(parts)
+            try:
+                resolved = str(path.expanduser().resolve())
+            except Exception:
+                resolved = str(path)
+            try:
+                stat = path.stat()
+            except OSError:
+                return ((resolved, None, None, None),)
+            return ((resolved, stat.st_ino, stat.st_mtime_ns, stat.st_size),)
 
         def _fingerprint_db_path(fingerprint: BoardFingerprint) -> str:
             if fingerprint:
@@ -5615,8 +5597,8 @@ class GatewayRunner:
             if reason == "io":
                 logger.error(
                     "kanban dispatcher: board %s database %s returned disk I/O "
-                    "error; disabling dispatch for this board until the DB/WAL "
-                    "files change or the gateway restarts. Check disk space, "
+                    "error; disabling dispatch for this board until the DB "
+                    "file changes or the gateway restarts. Check disk space, "
                     "filesystem permissions, WAL sidecars, or restore the board "
                     "from backup.",
                     slug,
