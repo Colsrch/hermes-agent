@@ -1288,6 +1288,31 @@ def init_db(
     return path
 
 
+def forget_db_path_cache(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> None:
+    """Forget per-process health/init cache for a kanban DB path.
+
+    Gateway dispatch disables a board after runtime SQLite I/O failures and
+    retries when the DB/WAL files change. If the path stays the same, the
+    per-process cache would otherwise skip the fresh integrity/migration pass
+    on that replacement file.
+    """
+    if db_path is not None:
+        path = db_path
+    else:
+        path = kanban_db_path(board=board)
+    try:
+        resolved = str(path.resolve())
+    except OSError:
+        resolved = str(path)
+    with _INIT_LOCK:
+        _INITIALIZED_PATHS.discard(resolved)
+        _CORRUPT_BACKUP_CACHE.pop(resolved, None)
+
+
 def _add_column_if_missing(
     conn: sqlite3.Connection, table: str, column: str, ddl: str
 ) -> bool:

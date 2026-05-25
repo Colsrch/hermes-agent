@@ -5463,30 +5463,97 @@ class GatewayRunner:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        disabled_corrupt_boards: dict[str, tuple[str, int | None, int | None]] = {}
+        BoardFingerprint = tuple[tuple[str, int | None, int | None], ...]
+        disabled_corrupt_boards: dict[str, BoardFingerprint] = {}
 
-        def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
+        def _board_db_fingerprint(slug: str) -> BoardFingerprint:
             path = _kb.kanban_db_path(slug)
-            try:
-                resolved = str(path.expanduser().resolve())
-            except Exception:
-                resolved = str(path)
-            try:
-                stat = path.stat()
-            except OSError:
-                return (resolved, None, None)
-            return (resolved, stat.st_mtime_ns, stat.st_size)
+            paths = [
+                path,
+                path.with_name(path.name + "-wal"),
+                path.with_name(path.name + "-shm"),
+            ]
+            parts: list[tuple[str, int | None, int | None]] = []
+            for item in paths:
+                try:
+                    resolved = str(item.expanduser().resolve())
+                except Exception:
+                    resolved = str(item)
+                try:
+                    stat = item.stat()
+                except OSError:
+                    parts.append((resolved, None, None))
+                else:
+                    parts.append((resolved, stat.st_mtime_ns, stat.st_size))
+            return tuple(parts)
 
-        def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            if isinstance(exc, getattr(_kb, "KanbanDbCorruptError", ())):
+        def _fingerprint_db_path(fingerprint: BoardFingerprint) -> str:
+            if fingerprint:
+                return fingerprint[0][0]
+            return "<unknown>"
+
+        def _disable_board_for_db_error(
+            slug: str,
+            fingerprint: BoardFingerprint,
+            reason: str,
+        ) -> None:
+            disabled_corrupt_boards[slug] = fingerprint
+            try:
+                _kb.forget_db_path_cache(board=slug)
+            except Exception:
+                pass
+            if reason == "io":
+                logger.error(
+                    "kanban dispatcher: board %s database %s returned disk I/O "
+                    "error; disabling dispatch for this board until the DB/WAL "
+                    "files change or the gateway restarts. Check disk space, "
+                    "filesystem permissions, WAL sidecars, or restore the board "
+                    "from backup.",
+                    slug,
+                    _fingerprint_db_path(fingerprint),
+                )
+                return
+            logger.error(
+                "kanban dispatcher: board %s database %s is not a valid "
+                "SQLite database; disabling dispatch for this board "
+                "until the file changes or the gateway restarts. Move "
+                "or restore the file, then run `hermes kanban init` if "
+                "you need a fresh board.",
+                slug,
+                _fingerprint_db_path(fingerprint),
+            )
+
+        def _is_board_disabled(slug: str) -> bool:
+            fingerprint = _board_db_fingerprint(slug)
+            disabled_fingerprint = disabled_corrupt_boards.get(slug)
+            if disabled_fingerprint == fingerprint:
                 return True
+            if disabled_fingerprint is not None:
+                logger.info(
+                    "kanban dispatcher: board %s database changed; retrying dispatch",
+                    slug,
+                )
+                disabled_corrupt_boards.pop(slug, None)
+                try:
+                    _kb.forget_db_path_cache(board=slug)
+                except Exception:
+                    pass
+            return False
+
+        def _board_db_error_reason(exc: Exception) -> "Optional[str]":
+            if isinstance(exc, getattr(_kb, "KanbanDbCorruptError", ())):
+                return "corrupt"
             if not isinstance(exc, sqlite3.DatabaseError):
-                return False
+                return None
             msg = str(exc).lower()
-            return (
+            if (
                 "file is not a database" in msg
                 or "database disk image is malformed" in msg
-            )
+            ):
+                return "corrupt"
+            if "disk i/o error" in msg:
+                return "io"
+            return None
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
@@ -5499,15 +5566,8 @@ class GatewayRunner:
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
-            disabled_fingerprint = disabled_corrupt_boards.get(slug)
-            if disabled_fingerprint == fingerprint:
+            if _is_board_disabled(slug):
                 return None
-            if disabled_fingerprint is not None:
-                logger.info(
-                    "kanban dispatcher: board %s database changed; retrying dispatch",
-                    slug,
-                )
-                disabled_corrupt_boards.pop(slug, None)
             try:
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
@@ -5525,32 +5585,16 @@ class GatewayRunner:
                     stale_timeout_seconds=stale_timeout_seconds,
                 )
             except sqlite3.DatabaseError as exc:
-                if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = fingerprint
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; disabling dispatch for this board "
-                        "until the file changes or the gateway restarts. Move "
-                        "or restore the file, then run `hermes kanban init` if "
-                        "you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                reason = _board_db_error_reason(exc)
+                if reason is not None:
+                    _disable_board_for_db_error(slug, fingerprint, reason)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             except Exception as exc:
-                if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = fingerprint
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; disabling dispatch for this board "
-                        "until the file changes or the gateway restarts. Move "
-                        "or restore the file, then run `hermes kanban init` if "
-                        "you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                reason = _board_db_error_reason(exc)
+                if reason is not None:
+                    _disable_board_for_db_error(slug, fingerprint, reason)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
@@ -5596,6 +5640,8 @@ class GatewayRunner:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if _is_board_disabled(slug):
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -5651,6 +5697,8 @@ class GatewayRunner:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
+                if _is_board_disabled(slug):
+                    continue
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and
