@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -110,6 +112,51 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+def test_kanban_notifier_disables_disk_io_board_without_retrying(
+    tmp_path, monkeypatch, caplog,
+):
+    db_path = tmp_path / "io-kanban.db"
+    db_path.write_bytes(b"SQLite format 3\x00" + b"x" * 128)
+
+    runner = _make_runner(RecordingAdapter())
+    calls = {"connect": 0, "to_thread": 0}
+
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"slug": slug})
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: db_path)
+
+    def _connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.OperationalError("disk I/O error")
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 4:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(kb, "connect", _connect)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("disk I/O error" in msg for msg in messages) == 1
+    assert not any("kanban notifier tick failed" in msg for msg in messages)
+    assert not any(record.exc_info for record in caplog.records)
+    assert calls["connect"] == 1
 
 
 @pytest.mark.parametrize(

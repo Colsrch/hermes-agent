@@ -48,13 +48,14 @@ SCHEMA_VERSION = 13
 # propagate that, every feature backed by state.db / kanban.db breaks
 # silently — /resume, /title, /history, /branch, kanban dispatcher, etc.
 #
-# Instead, fall back to ``journal_mode=DELETE`` (the pre-WAL default) which
-# works on NFS.  Concurrency drops — concurrent readers are blocked during
-# a write — but the feature works.
+# Instead, fall back to ``journal_mode=DELETE`` for known WAL-incompatible
+# setup errors.  Concurrency drops — concurrent readers are blocked during
+# a write — but the feature works.  Real storage failures, such as
+# ``SQLITE_IOERR`` / ``disk I/O error``, are not compatibility signals and
+# must propagate so callers stop touching a potentially damaged DB.
 _WAL_INCOMPAT_MARKERS = (
     "locking protocol",       # SQLITE_PROTOCOL on NFS/SMB
     "not authorized",         # Some FUSE mounts block WAL pragma outright
-    "disk i/o error",         # Flaky network FS during WAL setup
 )
 
 # Last SessionDB() init error, per-process.  Surfaced in /resume and
@@ -3276,4 +3277,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

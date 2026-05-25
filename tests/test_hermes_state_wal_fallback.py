@@ -110,13 +110,19 @@ class TestApplyWalWithFallback:
         assert mode == "delete"
         conn.close()
 
-    def test_falls_back_on_disk_io_error(self, tmp_path):
-        """Flaky network FS → disk I/O error → still fall back."""
+    def test_reraises_disk_io_error_without_delete_fallback(self, tmp_path):
+        """Real I/O failures must not trigger journal-mode fallback.
+
+        Retrying ``PRAGMA journal_mode=DELETE`` after a WAL setup disk I/O
+        error can keep perturbing the same DB/WAL sidecars while other
+        connections still hold them open. Treat it as a hard failure instead
+        of a network-filesystem compatibility signal.
+        """
         conn, _ = _open_blocking(
             tmp_path / "flaky.db", reason="disk I/O error", isolation_level=None
         )
-        mode = apply_wal_with_fallback(conn)
-        assert mode == "delete"
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            apply_wal_with_fallback(conn)
         conn.close()
 
     def test_reraises_unrelated_operational_error(self, tmp_path):

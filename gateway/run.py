@@ -4660,6 +4660,99 @@ class GatewayRunner:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
+        BoardFingerprint = tuple[tuple[str, int | None, int | None], ...]
+        disabled_db_boards: dict[str, BoardFingerprint] = getattr(
+            self, "_kanban_notifier_disabled_db_boards", {}
+        )
+        self._kanban_notifier_disabled_db_boards = disabled_db_boards
+
+        def _board_db_fingerprint(slug: str) -> BoardFingerprint:
+            path = _kb.kanban_db_path(slug)
+            paths = [
+                path,
+                path.with_name(path.name + "-wal"),
+                path.with_name(path.name + "-shm"),
+            ]
+            parts: list[tuple[str, int | None, int | None]] = []
+            for item in paths:
+                try:
+                    resolved = str(item.expanduser().resolve())
+                except Exception:
+                    resolved = str(item)
+                try:
+                    stat = item.stat()
+                except OSError:
+                    parts.append((resolved, None, None))
+                else:
+                    parts.append((resolved, stat.st_mtime_ns, stat.st_size))
+            return tuple(parts)
+
+        def _fingerprint_db_path(fingerprint: BoardFingerprint) -> str:
+            if fingerprint:
+                return fingerprint[0][0]
+            return "<unknown>"
+
+        def _board_db_error_reason(exc: Exception) -> Optional[str]:
+            if isinstance(exc, getattr(_kb, "KanbanDbCorruptError", ())):
+                return "corrupt"
+            if not isinstance(exc, sqlite3.DatabaseError):
+                return None
+            msg = str(exc).lower()
+            if (
+                "file is not a database" in msg
+                or "database disk image is malformed" in msg
+            ):
+                return "corrupt"
+            if "disk i/o error" in msg:
+                return "io"
+            return None
+
+        def _disable_board_for_db_error(
+            slug: str,
+            fingerprint: BoardFingerprint,
+            reason: str,
+        ) -> None:
+            disabled_db_boards[slug] = fingerprint
+            try:
+                _kb.forget_db_path_cache(board=slug)
+            except Exception:
+                pass
+            if reason == "io":
+                logger.error(
+                    "kanban notifier: board %s database %s returned disk I/O "
+                    "error; disabling notifications for this board until the "
+                    "DB/WAL files change or the gateway restarts. Check disk "
+                    "space, filesystem permissions, WAL sidecars, or restore "
+                    "the board from backup.",
+                    slug,
+                    _fingerprint_db_path(fingerprint),
+                )
+                return
+            logger.error(
+                "kanban notifier: board %s database %s is not a valid SQLite "
+                "database; disabling notifications for this board until the "
+                "file changes or the gateway restarts. Move or restore the "
+                "file, then run `hermes kanban init` if you need a fresh board.",
+                slug,
+                _fingerprint_db_path(fingerprint),
+            )
+
+        def _is_board_disabled(slug: str, fingerprint: BoardFingerprint) -> bool:
+            disabled_fingerprint = disabled_db_boards.get(slug)
+            if disabled_fingerprint == fingerprint:
+                return True
+            if disabled_fingerprint is not None:
+                logger.info(
+                    "kanban notifier: board %s database changed; retrying notifications",
+                    slug,
+                )
+                disabled_db_boards.pop(slug, None)
+                try:
+                    _kb.forget_db_path_cache(board=slug)
+                except Exception:
+                    pass
+            return False
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -4699,9 +4792,16 @@ class GatewayRunner:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        fingerprint = _board_db_fingerprint(slug)
+                        if _is_board_disabled(slug, fingerprint):
+                            continue
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
+                            reason = _board_db_error_reason(exc)
+                            if reason is not None:
+                                _disable_board_for_db_error(slug, fingerprint, reason)
+                                continue
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
@@ -4761,6 +4861,10 @@ class GatewayRunner:
                             try:
                                 dsubs = _kb.list_delivery_subs(conn)
                             except Exception as exc:
+                                reason = _board_db_error_reason(exc)
+                                if reason is not None:
+                                    _disable_board_for_db_error(slug, fingerprint, reason)
+                                    continue
                                 logger.debug(
                                     "kanban notifier: cannot list delivery subscriptions on board %s: %s",
                                     slug, exc,
@@ -4803,6 +4907,12 @@ class GatewayRunner:
                                     "board": slug,
                                     "is_delivery": True,
                                 })
+                        except Exception as exc:
+                            reason = _board_db_error_reason(exc)
+                            if reason is not None:
+                                _disable_board_for_db_error(slug, fingerprint, reason)
+                                continue
+                            raise
                         finally:
                             conn.close()
                     return deliveries
