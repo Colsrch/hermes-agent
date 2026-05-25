@@ -5145,6 +5145,7 @@ class GatewayRunner:
         if not chat_id:
             return None
         thread_id = str(dsub.get("thread_id") or "").strip() or None
+        message_id = str(dsub.get("message_id") or "").strip() or None
         return SessionSource(
             platform=platform,
             chat_id=chat_id,
@@ -5152,6 +5153,7 @@ class GatewayRunner:
             user_id="system:kanban-delivery",
             user_name="Kanban",
             thread_id=thread_id,
+            message_id=message_id,
         )
 
     def _kanban_delivery_text(self, dsub: dict, task, event) -> str:
@@ -5476,6 +5478,8 @@ class GatewayRunner:
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
+            if isinstance(exc, getattr(_kb, "KanbanDbCorruptError", ())):
+                return True
             if not isinstance(exc, sqlite3.DatabaseError):
                 return False
             msg = str(exc).lower()
@@ -5535,7 +5539,19 @@ class GatewayRunner:
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
-            except Exception:
+            except Exception as exc:
+                if _is_corrupt_board_db_error(exc):
+                    disabled_corrupt_boards[slug] = fingerprint
+                    logger.error(
+                        "kanban dispatcher: board %s database %s is not a valid "
+                        "SQLite database; disabling dispatch for this board "
+                        "until the file changes or the gateway restarts. Move "
+                        "or restore the file, then run `hermes kanban init` if "
+                        "you need a fresh board.",
+                        slug,
+                        fingerprint[0],
+                    )
+                    return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             finally:

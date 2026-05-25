@@ -135,6 +135,7 @@ def test_kanban_delivery_injects_synthetic_message_and_removes_sub(
             session_key="agent:main:telegram:dm:chat-1",
             platform="telegram",
             chat_id="chat-1",
+            message_id="msg-42",
             notifier_profile="default",
         )
         if event_kind == "completed":
@@ -155,6 +156,8 @@ def test_kanban_delivery_injects_synthetic_message_and_removes_sub(
     assert event.internal is True
     assert event.source.platform == Platform.TELEGRAM
     assert event.source.chat_id == "chat-1"
+    assert event.source.message_id == "msg-42"
+    assert event.message_id == "msg-42"
     assert tid in event.text
     assert event_kind in event.text
     assert expected_detail in event.text

@@ -115,6 +115,26 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_run_id_error(task_id: str) -> Optional[str]:
+    """Return a tool error if a scoped worker has no valid run token."""
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not raw:
+        return tool_error(
+            "HERMES_KANBAN_RUN_ID is required for scoped worker lifecycle "
+            "writes; refusing to mutate task state without run ownership."
+        )
+    try:
+        int(raw)
+    except ValueError:
+        return tool_error(
+            f"HERMES_KANBAN_RUN_ID must be an integer, got {raw!r}; "
+            "refusing to mutate task state without run ownership."
+        )
+    return None
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -161,6 +181,25 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _enforce_worker_board_scope(board: Any) -> Optional[str]:
+    """Reject explicit cross-board access from dispatcher-pinned workers."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    if board is None or not str(board).strip():
+        return None
+    pinned = os.environ.get("HERMES_KANBAN_BOARD")
+    if not pinned:
+        return None
+    requested = str(board).strip().lower()
+    current = str(pinned).strip().lower()
+    if requested != current:
+        return tool_error(
+            f"worker is pinned to board {current}; refusing to access "
+            f"board {requested}. Omit board or use the pinned board."
+        )
+    return None
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -173,6 +212,13 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
+    if board is not None and not os.environ.get("HERMES_KANBAN_TASK"):
+        slug = kb._normalize_board_slug(board) or kb.DEFAULT_BOARD
+        if slug == kb.DEFAULT_BOARD:
+            path = kb.kanban_home() / "kanban.db"
+        else:
+            path = kb.board_dir(slug) / "kanban.db"
+        return kb, kb.connect(db_path=path)
     return kb, kb.connect(board=board)
 
 
@@ -261,6 +307,9 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -351,6 +400,9 @@ def _handle_list(args: dict, **kw) -> str:
     if limit > KANBAN_LIST_MAX_LIMIT:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -465,7 +517,13 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    run_id_err = _worker_run_id_error(tid)
+    if run_id_err:
+        return run_id_err
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -500,7 +558,15 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
-            run = kb.latest_run(conn, tid)
+            try:
+                run = kb.latest_run(conn, tid)
+            except Exception:
+                logger.warning(
+                    "kanban_complete: latest_run lookup failed for %s",
+                    tid,
+                    exc_info=True,
+                )
+                run = None
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -524,7 +590,13 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    run_id_err = _worker_run_id_error(tid)
+    if run_id_err:
+        return run_id_err
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -568,7 +640,13 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     note = args.get("note")
+    run_id_err = _worker_run_id_error(tid)
+    if run_id_err:
+        return run_id_err
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -578,7 +656,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+            if not kb.heartbeat_claim(conn, tid, claimer=claim_lock):
+                return tool_error(
+                    f"could not heartbeat {tid}: claim is no longer owned "
+                    "by this worker or the claim lock is stale"
+                )
 
             ok = kb.heartbeat_worker(
                 conn,
@@ -622,6 +704,9 @@ def _handle_comment(args: dict, **kw) -> str:
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -685,6 +770,33 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
+    from hermes_cli.kanban_db import DeliveryRegistrationError
+
+    delivery_ctx: Optional[dict[str, str]] = None
+    if delivery:
+        from gateway.session_context import get_session_env
+
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+        if not (session_key and platform and chat_id):
+            return tool_error(
+                "delivery=true requires a gateway session context "
+                "(HERMES_SESSION_KEY, HERMES_SESSION_PLATFORM, and "
+                "HERMES_SESSION_CHAT_ID)."
+            )
+        delivery_ctx = {
+            "session_key": session_key,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id or "",
+            "message_id": message_id or "",
+        }
     try:
         kb, conn = _connect(board=board)
         try:
@@ -708,34 +820,23 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                board=board,
+                delivery_sub={
+                    **delivery_ctx,
+                    "notifier_profile": os.environ.get("HERMES_PROFILE"),
+                } if delivery_ctx is not None else None,
             )
-            if delivery:
-                try:
-                    from gateway.session_context import get_session_env
-
-                    session_key = get_session_env("HERMES_SESSION_KEY", "")
-                    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-                    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-                    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
-                    if session_key and platform and chat_id:
-                        kb.add_delivery_sub(
-                            conn,
-                            task_id=new_tid,
-                            session_key=session_key,
-                            platform=platform,
-                            chat_id=chat_id,
-                            thread_id=thread_id or "",
-                            notifier_profile=os.environ.get("HERMES_PROFILE"),
-                        )
-                except Exception:
-                    logger.debug("kanban_create delivery registration failed", exc_info=True)
             new_task = kb.get_task(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                delivery_registered=delivery_ctx is not None,
             )
         finally:
             conn.close()
+    except DeliveryRegistrationError as e:
+        logger.debug("kanban_create delivery registration failed", exc_info=True)
+        return tool_error(f"kanban_create delivery registration failed: {e}")
     except ValueError as e:
         return tool_error(f"kanban_create: {e}")
     except Exception as e:
@@ -778,6 +879,9 @@ def _handle_link(args: dict, **kw) -> str:
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
+    board_err = _enforce_worker_board_scope(board)
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:

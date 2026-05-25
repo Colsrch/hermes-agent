@@ -68,6 +68,98 @@ def test_idempotency_key_ignored_for_archived(kanban_home):
         conn.close()
 
 
+def test_create_task_with_delivery_sub_rolls_back_on_delivery_failure(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        before = len(kb.list_tasks(conn))
+
+        def fail_delivery(*args, **kwargs):
+            raise RuntimeError("delivery insert failed")
+
+        monkeypatch.setattr(kb, "_add_delivery_sub_in_txn", fail_delivery, raising=False)
+
+        with pytest.raises(RuntimeError, match="delivery insert failed"):
+            kb.create_task(
+                conn,
+                title="atomic delivery",
+                assignee="worker",
+                delivery_sub={
+                    "session_key": "agent:main:telegram:dm:123",
+                    "platform": "telegram",
+                    "chat_id": "123",
+                    "thread_id": "",
+                    "message_id": "",
+                    "notifier_profile": "default",
+                },
+            )
+
+        assert len(kb.list_tasks(conn)) == before
+    finally:
+        conn.close()
+
+
+def test_create_task_delivery_sub_idempotency_refreshes_existing_task(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="first",
+            assignee="worker",
+            idempotency_key="deliver-once",
+        )
+        again = kb.create_task(
+            conn,
+            title="second attempt",
+            assignee="worker",
+            idempotency_key="deliver-once",
+            delivery_sub={
+                "session_key": "agent:main:telegram:dm:123",
+                "platform": "telegram",
+                "chat_id": "123",
+                "thread_id": "topic",
+                "message_id": "msg-1",
+                "notifier_profile": "default",
+            },
+        )
+
+        assert again == tid
+        task = kb.get_task(conn, tid)
+        assert task.title == "first"
+        subs = kb.list_delivery_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["session_key"] == "agent:main:telegram:dm:123"
+        assert subs[0]["thread_id"] == "topic"
+        assert subs[0]["message_id"] == "msg-1"
+    finally:
+        conn.close()
+
+
+def test_complete_task_advisory_scan_failure_does_not_undo_completion(
+    kanban_home, monkeypatch
+):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="scan failure", assignee="worker")
+
+        def fail_scan(conn_arg, text):
+            raise RuntimeError("scan failed")
+
+        monkeypatch.setattr(kb, "_scan_prose_for_phantom_ids", fail_scan)
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="completed with reference t_deadbeef",
+        ) is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "completed" for e in events)
+    finally:
+        conn.close()
+
+
 def test_no_idempotency_key_never_collides(kanban_home):
     conn = kb.connect()
     try:
@@ -699,6 +791,42 @@ def test_delivery_sub_crud_and_cursor(kanban_home):
     finally:
         conn1.close()
         conn2.close()
+
+
+def test_add_delivery_sub_updates_routing_metadata_on_duplicate(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="delivery update", assignee="w")
+        kb.add_delivery_sub(
+            conn,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="old-chat",
+            thread_id="old-topic",
+            message_id="old-message",
+            notifier_profile="default",
+        )
+        kb.add_delivery_sub(
+            conn,
+            task_id=tid,
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="new-chat",
+            thread_id="new-topic",
+            message_id="new-message",
+            notifier_profile="new-profile",
+        )
+
+        subs = kb.list_delivery_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["platform"] == "telegram"
+        assert subs[0]["chat_id"] == "new-chat"
+        assert subs[0]["thread_id"] == "new-topic"
+        assert subs[0]["message_id"] == "new-message"
+        assert subs[0]["notifier_profile"] == "default"
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -3759,6 +3887,83 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     # disabled, but the ready/review probes still each connect. PR f55d94a1e
     # added the review-column probe alongside the existing ready-column
     # probe, bumping this from 3 → 5.
+    assert calls["connect"] == 5
+
+
+def test_gateway_dispatcher_disables_integrity_guard_corrupt_board_without_traceback(
+    monkeypatch, tmp_path, caplog
+):
+    """KanbanDbCorruptError should use the same disable path as sqlite corruption."""
+    import asyncio
+    import logging
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    corrupt_db = tmp_path / "kanban.db"
+    corrupt_db.write_bytes(b"SQLite format 3\x00" + b"x" * 128)
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "read_board_metadata",
+        lambda slug: {"slug": slug},
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
+
+    calls = {"connect": 0, "to_thread": 0}
+
+    def _connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise _kb.KanbanDbCorruptError(
+            corrupt_db,
+            corrupt_db.with_name("kanban.db.corrupt.test.bak"),
+            "integrity_check returned 'bad index'",
+        )
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 4:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("not a valid SQLite database" in msg for msg in messages) == 1
+    assert not any("tick failed on board" in msg for msg in messages)
+    assert not any(record.exc_info for record in caplog.records)
     assert calls["connect"] == 5
 
 

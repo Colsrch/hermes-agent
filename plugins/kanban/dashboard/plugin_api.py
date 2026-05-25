@@ -108,19 +108,15 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
 def _conn(board: Optional[str] = None):
     """Open a kanban_db connection, creating the schema on first use.
 
-    Every handler that mutates the DB goes through this so the plugin
-    self-heals on a fresh install (no user-visible "no such table"
-    error if somebody hits POST /tasks before GET /board).
-    ``init_db`` is idempotent.
+    ``kanban_db.connect`` auto-initializes the schema on first open. Do not
+    call ``init_db`` here: it deliberately clears the per-process migration
+    cache, and if initialization fails (corrupt DB / busy lock) retrying with
+    a second connection can duplicate backups or mask the original failure.
 
     ``board`` is the query-param slug (already normalised by
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
-    try:
-        kanban_db.init_db(board=board)
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
 
 

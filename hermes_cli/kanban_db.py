@@ -945,6 +945,7 @@ CREATE TABLE IF NOT EXISTS kanban_delivery_subs (
     platform      TEXT NOT NULL,
     chat_id       TEXT NOT NULL,
     thread_id     TEXT NOT NULL DEFAULT '',
+    message_id    TEXT,
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
@@ -969,6 +970,7 @@ CREATE INDEX IF NOT EXISTS idx_delivery_task         ON kanban_delivery_subs(tas
 # ---------------------------------------------------------------------------
 
 _INITIALIZED_PATHS: set[str] = set()
+_CORRUPT_BACKUP_CACHE: dict[str, tuple[tuple[tuple[str, int | None, int | None], ...], Optional[Path]]] = {}
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
@@ -1091,6 +1093,44 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
+def _corrupt_backup_fingerprint(path: Path) -> tuple[tuple[str, int | None, int | None], ...]:
+    """Fingerprint the DB file plus WAL/SHM sidecars for backup de-duping."""
+    resolved = path.resolve()
+    parent = resolved.parent
+    names = (resolved.name, resolved.name + "-wal", resolved.name + "-shm")
+    parts: list[tuple[str, int | None, int | None]] = []
+    for name in names:
+        item = parent / name
+        try:
+            stat = item.stat()
+        except OSError:
+            parts.append((name, None, None))
+        else:
+            parts.append((name, stat.st_mtime_ns, stat.st_size))
+    return tuple(parts)
+
+
+def _backup_corrupt_db_once(path: Path) -> Optional[Path]:
+    """Copy a corrupt DB once per unchanged on-disk fingerprint."""
+    try:
+        resolved = path.resolve()
+        fingerprint = _corrupt_backup_fingerprint(resolved)
+    except OSError:
+        return _backup_corrupt_db(path)
+    cache_key = str(resolved)
+    with _INIT_LOCK:
+        cached = _CORRUPT_BACKUP_CACHE.get(cache_key)
+        if cached is not None:
+            cached_fingerprint, cached_backup = cached
+            if cached_fingerprint == fingerprint and (
+                cached_backup is None or cached_backup.exists()
+            ):
+                return cached_backup
+        backup = _backup_corrupt_db(resolved)
+        _CORRUPT_BACKUP_CACHE[cache_key] = (fingerprint, backup)
+        return backup
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
@@ -1144,8 +1184,10 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
+        with _INIT_LOCK:
+            _CORRUPT_BACKUP_CACHE.pop(str(resolved), None)
         return
-    backup = _backup_corrupt_db(resolved)
+    backup = _backup_corrupt_db_once(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -1360,7 +1402,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
     if "model_override" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
+        _add_column_if_missing(
+            conn, "tasks", "model_override", "model_override TEXT"
+        )
 
     if "session_id" not in cols:
         # Originating agent/chat session id, populated when the task is
@@ -1420,6 +1464,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             platform      TEXT NOT NULL,
             chat_id       TEXT NOT NULL,
             thread_id     TEXT NOT NULL DEFAULT '',
+            message_id    TEXT,
             notifier_profile TEXT,
             created_at    INTEGER NOT NULL,
             last_event_id INTEGER NOT NULL DEFAULT 0,
@@ -1427,6 +1472,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    delivery_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(kanban_delivery_subs)")
+    }
+    if "message_id" not in delivery_cols:
+        _add_column_if_missing(
+            conn, "kanban_delivery_subs", "message_id", "message_id TEXT"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_delivery_task "
         "ON kanban_delivery_subs(task_id)"
@@ -1582,6 +1634,7 @@ def create_task(
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
+    delivery_sub: Optional[dict[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -1670,21 +1723,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -1701,6 +1739,24 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # The idempotency lookup must run under BEGIN IMMEDIATE. A
+                # pre-transaction lookup lets two concurrent creators both
+                # observe "missing" and insert duplicate active rows.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        existing_id = row["id"]
+                        if delivery_sub is not None:
+                            _add_delivery_sub_for_task_in_txn(
+                                conn, task_id=existing_id, delivery_sub=delivery_sub
+                            )
+                        return existing_id
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -1780,6 +1836,10 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
+                if delivery_sub is not None:
+                    _add_delivery_sub_for_task_in_txn(
+                        conn, task_id=task_id, delivery_sub=delivery_sub
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3041,30 +3101,51 @@ def complete_task(
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
     # time we emit the warning.
-    scan_text = " ".join(filter(None, [summary, result]))
-    if scan_text:
-        phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
-        # Drop any phantom refs that were already flagged as verified
-        # above (shouldn't happen — verified means they exist — but
-        # belt-and-suspenders).
-        phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
-        if phantom_refs:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "suspected_hallucinated_references",
-                    {
-                        "phantom_refs": phantom_refs,
-                        "source": "completion_summary",
-                    },
-                    run_id=run_id,
-                )
+    try:
+        scan_text = " ".join(filter(None, [summary, result]))
+        if scan_text:
+            phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+            # Drop any phantom refs that were already flagged as verified
+            # above (shouldn't happen — verified means they exist — but
+            # belt-and-suspenders).
+            phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
+            if phantom_refs:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "suspected_hallucinated_references",
+                        {
+                            "phantom_refs": phantom_refs,
+                            "source": "completion_summary",
+                        },
+                        run_id=run_id,
+                    )
+    except Exception:
+        _log.warning(
+            "kanban: completion advisory postprocess failed for task %s",
+            task_id,
+            exc_info=True,
+        )
     # Successful completion — wipe the consecutive-failures counter.
     # Failure history stays on the event log for audit; the counter
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
-    _clear_failure_counter(conn, task_id)
+    try:
+        _clear_failure_counter(conn, task_id)
+    except Exception:
+        _log.warning(
+            "kanban: completion failure-counter reset failed for task %s",
+            task_id,
+            exc_info=True,
+        )
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    try:
+        recompute_ready(conn)
+    except Exception:
+        _log.warning(
+            "kanban: completion dependent promotion failed for task %s",
+            task_id,
+            exc_info=True,
+        )
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
@@ -4139,7 +4220,12 @@ def _pid_alive(pid: Optional[int]) -> bool:
     if not pid or pid <= 0:
         return False
     from gateway.status import _pid_exists
-    if not _pid_exists(int(pid)):
+    try:
+        exists = _pid_exists(int(pid))
+    except Exception as exc:
+        _log.debug("kanban pid liveness probe failed for pid %s: %s", pid, exc)
+        return False
+    if not exists:
         return False
     # Still here → process exists. Check for zombie on platforms
     # where we have a cheap, deterministic process-state probe.
@@ -4212,6 +4298,9 @@ def _terminate_reclaimed_worker(
         kill(int(pid), signal.SIGTERM)
     except (ProcessLookupError, OSError):
         return info
+    except Exception as exc:
+        info["termination_error"] = str(exc)
+        return info
 
     for _ in range(10):
         if not _pid_alive(pid):
@@ -4227,6 +4316,9 @@ def _terminate_reclaimed_worker(
             kill(int(pid), _sigkill)
             info["sigkill"] = True
         except (ProcessLookupError, OSError):
+            return info
+        except Exception as exc:
+            info["termination_error"] = str(exc)
             return info
 
     info["terminated"] = not _pid_alive(pid)
@@ -6333,6 +6425,71 @@ def rewind_notify_cursor(
 # Delivery subscriptions (gateway synthetic-message wakeups)
 # ---------------------------------------------------------------------------
 
+
+class DeliveryRegistrationError(RuntimeError):
+    """Raised when atomic task creation cannot register delivery."""
+
+
+def _add_delivery_sub_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    session_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> None:
+    """Register a delivery subscription inside the caller's write txn."""
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO kanban_delivery_subs
+            (task_id, session_key, platform, chat_id, thread_id,
+             message_id, notifier_profile, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, session_key) DO UPDATE SET
+            platform = excluded.platform,
+            chat_id = excluded.chat_id,
+            thread_id = excluded.thread_id,
+            message_id = COALESCE(
+                NULLIF(excluded.message_id, ''),
+                kanban_delivery_subs.message_id
+            ),
+            notifier_profile = COALESCE(
+                NULLIF(kanban_delivery_subs.notifier_profile, ''),
+                excluded.notifier_profile
+            )
+        """,
+        (
+            task_id, session_key, platform, chat_id, thread_id or "",
+            message_id or "", notifier_profile, now,
+        ),
+    )
+
+
+def _add_delivery_sub_for_task_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    delivery_sub: dict[str, Any],
+) -> None:
+    try:
+        _add_delivery_sub_in_txn(
+            conn,
+            task_id=task_id,
+            session_key=delivery_sub.get("session_key", ""),
+            platform=delivery_sub.get("platform", ""),
+            chat_id=delivery_sub.get("chat_id", ""),
+            thread_id=delivery_sub.get("thread_id"),
+            message_id=delivery_sub.get("message_id"),
+            notifier_profile=delivery_sub.get("notifier_profile"),
+        )
+    except Exception as exc:
+        raise DeliveryRegistrationError(str(exc)) from exc
+
+
 def add_delivery_sub(
     conn: sqlite3.Connection,
     *,
@@ -6341,33 +6498,21 @@ def add_delivery_sub(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    message_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
 ) -> None:
     """Register a gateway session for one-shot agent delivery."""
-    now = int(time.time())
     with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_delivery_subs
-                (task_id, session_key, platform, chat_id, thread_id,
-                 notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id, session_key, platform, chat_id, thread_id or "",
-                notifier_profile, now,
-            ),
+        _add_delivery_sub_in_txn(
+            conn,
+            task_id=task_id,
+            session_key=session_key,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id,
+            notifier_profile=notifier_profile,
         )
-        if notifier_profile:
-            conn.execute(
-                """
-                UPDATE kanban_delivery_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND session_key = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, session_key),
-            )
 
 
 def list_delivery_subs(

@@ -59,6 +59,35 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def test_conn_does_not_double_open_when_connect_fails(monkeypatch, tmp_path):
+    """Dashboard connection helper should not init-then-connect a corrupt DB."""
+    import plugins.kanban.dashboard.plugin_api as pa
+
+    db_path = tmp_path / "kanban.db"
+    init_calls: list[object] = []
+    connect_calls: list[object] = []
+
+    def _init_db(*args, **kwargs):
+        init_calls.append((args, kwargs))
+
+    def _connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        raise kb.KanbanDbCorruptError(
+            db_path,
+            db_path.with_name("kanban.db.corrupt.test.bak"),
+            "integrity_check returned 'bad index'",
+        )
+
+    monkeypatch.setattr(pa.kanban_db, "init_db", _init_db)
+    monkeypatch.setattr(pa.kanban_db, "connect", _connect)
+
+    with pytest.raises(kb.KanbanDbCorruptError):
+        pa._conn(board="default")
+
+    assert init_calls == []
+    assert len(connect_calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------

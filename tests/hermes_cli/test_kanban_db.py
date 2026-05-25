@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -162,6 +164,41 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.status == "ready"
     assert t.assignee == "alice"
     assert t.workspace_kind == "scratch"
+
+
+def test_create_task_idempotency_key_is_atomic_across_connections(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+
+    original_write_txn = kb.write_txn
+    barrier = threading.Barrier(2)
+
+    @contextlib.contextmanager
+    def gated_write_txn(conn):
+        barrier.wait(timeout=5)
+        with original_write_txn(conn) as txn:
+            yield txn
+
+    monkeypatch.setattr(kb, "write_txn", gated_write_txn)
+
+    def create_one(title: str) -> str:
+        with kb.connect(db_path=db_path) as conn:
+            return kb.create_task(
+                conn,
+                title=title,
+                idempotency_key="same-request",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        ids = list(executor.map(create_one, ["first", "second"]))
+
+    assert ids[0] == ids[1]
+    with kb.connect(db_path=db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, title FROM tasks WHERE idempotency_key = ?",
+            ("same-request",),
+        ).fetchall()
+    assert len(rows) == 1
 
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
@@ -2131,6 +2168,7 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
             current_step_key TEXT,
             skills TEXT,
             max_retries INTEGER,
+            model_override TEXT,
             session_id TEXT
         )
         """
@@ -2150,6 +2188,70 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
 
     # Running migration on an already-migrated schema must not raise.
     kb._migrate_add_optional_columns(conn)
+    conn.close()
+
+
+def test_migrate_model_override_column_is_idempotent_on_race(kanban_home):
+    """The model_override migration must use the duplicate-column guard."""
+    import sqlite3
+
+    class RacingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+            self._triggered = False
+
+        def execute(self, sql, *args, **kwargs):
+            if (
+                sql.strip().lower()
+                == "alter table tasks add column model_override text"
+                and not self._triggered
+            ):
+                self._triggered = True
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
+            return self._conn.execute(sql, *args, **kwargs)
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            tenant TEXT,
+            result TEXT,
+            idempotency_key TEXT,
+            branch_name TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER,
+            last_failure_error TEXT,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            workflow_template_id TEXT,
+            current_step_key TEXT,
+            skills TEXT,
+            max_retries INTEGER,
+            session_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    TEXT NOT NULL DEFAULT '',
+            run_id     INTEGER,
+            kind       TEXT NOT NULL DEFAULT '',
+            payload    TEXT,
+            created_at INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+    kb._migrate_add_optional_columns(RacingConnection(conn))
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert "model_override" in columns
     conn.close()
 
 
@@ -3038,6 +3140,21 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
         kb.connect(db_path=db_path)
 
 
+def test_repeated_corrupt_connect_reuses_existing_backup(tmp_path):
+    """Repeated probes of the same corrupt file must not create a backup storm."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    for _ in range(3):
+        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+            kb.connect(db_path=db_path)
+        assert excinfo.value.backup_path is not None
+
+    backups = sorted(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(backups) == 1
+
+
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     """A transient lock during the probe must not produce a .corrupt backup
     and must not be reported as :class:`KanbanDbCorruptError`. Raw sqlite
@@ -3187,4 +3304,3 @@ def test_maybe_emit_scratch_tip_skips_non_scratch_workspaces(kanban_home, caplog
                 "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
             ).fetchall()
             assert "tip_scratch_workspace" not in [e["kind"] for e in events]
-

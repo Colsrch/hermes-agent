@@ -164,10 +164,15 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    if run is not None:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    if claimed is not None and claimed.claim_lock:
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
     return tid
 
 
@@ -686,6 +691,21 @@ def test_heartbeat_extends_claim_expires(worker_env):
     )
 
 
+def test_heartbeat_rejects_wrong_claim_lock(monkeypatch, worker_env):
+    """A stale worker must not record a heartbeat if it cannot renew claim."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "wrong-lock")
+    out = kt._handle_heartbeat({"note": "stale"})
+    err = json.loads(out).get("error", "")
+    assert "claim is no longer owned" in err
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, worker_env) if e.kind == "heartbeat"]
+    assert events == []
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({
@@ -796,6 +816,7 @@ def test_create_delivery_registers_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "topic-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "msg-42")
     monkeypatch.setenv("HERMES_PROFILE", "gateway-profile")
 
     from tools import kanban_tools as kt
@@ -809,6 +830,7 @@ def test_create_delivery_registers_gateway_session(monkeypatch, worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
+    assert d["delivery_registered"] is True
 
     conn = kb.connect()
     try:
@@ -821,7 +843,98 @@ def test_create_delivery_registers_gateway_session(monkeypatch, worker_env):
     assert subs[0]["platform"] == "telegram"
     assert subs[0]["chat_id"] == "chat-1"
     assert subs[0]["thread_id"] == "topic-1"
+    assert subs[0]["message_id"] == "msg-42"
     assert subs[0]["notifier_profile"] == "gateway-profile"
+
+
+def test_create_delivery_requires_gateway_session_context(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        before = len(kb.list_tasks(conn))
+
+    out = kt._handle_create({
+        "title": "no delivery context",
+        "assignee": "peer",
+        "delivery": True,
+    })
+    err = json.loads(out).get("error", "")
+    assert "requires a gateway session context" in err
+
+    with kb.connect() as conn:
+        assert len(kb.list_tasks(conn)) == before
+
+
+def test_create_delivery_reports_registration_failure(monkeypatch, worker_env):
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:chat-1")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        before = len(kb.list_tasks(conn))
+
+    def fail_add_delivery_sub(*args, **kwargs):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(kb, "_add_delivery_sub_in_txn", fail_add_delivery_sub, raising=False)
+
+    out = kt._handle_create({
+        "title": "delivery write fails",
+        "assignee": "peer",
+        "delivery": True,
+    })
+    err = json.loads(out).get("error", "")
+    assert "delivery registration failed" in err
+    assert "db locked" in err
+
+    with kb.connect() as conn:
+        assert len(kb.list_tasks(conn)) == before
+
+
+def test_complete_returns_ok_when_postprocess_recompute_fails(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    def fail_recompute_ready(conn):
+        raise RuntimeError("transient recompute failure")
+
+    monkeypatch.setattr(kb, "recompute_ready", fail_recompute_ready)
+
+    out = kt._handle_complete({
+        "summary": "done despite postprocess failure",
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task.status == "done"
+
+
+def test_complete_returns_ok_when_latest_run_lookup_fails(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    def fail_latest_run(conn, task_id):
+        raise RuntimeError("read after write failed")
+
+    monkeypatch.setattr(kb, "latest_run", fail_latest_run)
+
+    out = kt._handle_complete({
+        "summary": "done before response lookup failed",
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+    assert data["task_id"] == worker_env
+    assert data["run_id"] is None
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task.status == "done"
 
 
 def test_create_delivery_rejects_bad_boolean(worker_env):
@@ -1356,6 +1469,55 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
+def test_worker_pinned_board_rejects_foreign_board_for_worker_tools(
+    monkeypatch, worker_env
+):
+    """Dispatcher-pinned workers must not bypass board isolation via board=."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+    def _connect_should_not_run(board=None):
+        raise AssertionError(f"handler connected to board {board!r}")
+
+    monkeypatch.setattr(kt, "_connect", _connect_should_not_run)
+
+    calls = [
+        ("kanban_show", kt._handle_show, {"board": "alt"}),
+        (
+            "kanban_complete",
+            kt._handle_complete,
+            {"summary": "done", "board": "alt"},
+        ),
+        (
+            "kanban_block",
+            kt._handle_block,
+            {"reason": "blocked", "board": "alt"},
+        ),
+        ("kanban_heartbeat", kt._handle_heartbeat, {"board": "alt"}),
+        (
+            "kanban_comment",
+            kt._handle_comment,
+            {"task_id": worker_env, "body": "handoff", "board": "alt"},
+        ),
+        (
+            "kanban_create",
+            kt._handle_create,
+            {"title": "child", "assignee": "peer", "board": "alt"},
+        ),
+        (
+            "kanban_link",
+            kt._handle_link,
+            {"parent_id": worker_env, "child_id": "t_peer", "board": "alt"},
+        ),
+    ]
+
+    for name, handler, args in calls:
+        out = handler(args)
+        err = json.loads(out).get("error", "")
+        assert "pinned to board default" in err, f"{name}: {out}"
+
+
 def test_worker_complete_own_task_still_works(worker_env):
     """The ownership check doesn't break the normal own-task happy path."""
     from tools import kanban_tools as kt
@@ -1401,6 +1563,34 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     out = kt._handle_complete({"summary": "current completion"})
     d = json.loads(out)
     assert d.get("ok") is True
+
+
+def test_worker_complete_rejects_missing_run_id(worker_env, monkeypatch):
+    """Scoped worker lifecycle writes require the dispatcher run token."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    out = kt._handle_complete({"summary": "missing run id"})
+    err = json.loads(out).get("error", "")
+    assert "HERMES_KANBAN_RUN_ID is required" in err
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_worker_complete_rejects_malformed_run_id(worker_env, monkeypatch):
+    """Malformed run tokens must not disable current_run_id CAS checks."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-an-int")
+    out = kt._handle_complete({"summary": "bad run id"})
+    err = json.loads(out).get("error", "")
+    assert "must be an integer" in err
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
 
 
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
@@ -1512,6 +1702,27 @@ def test_board_param_routes_create_to_alt_board(multi_board_env):
         assert kb.get_task(conn, new_tid) is None
 
 
+def test_board_param_create_uses_target_board_default_workdir(multi_board_env):
+    """kanban_create must pass board through to create_task metadata lookup."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    alt_workdir = "/tmp/hermes-alt-workdir"
+    kb.write_board_metadata("alt", default_workdir=alt_workdir)
+
+    out = kt._handle_create({
+        "title": "alt-default-workdir",
+        "assignee": "worker",
+        "board": "alt",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+
+    with kb.connect(board="alt") as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.workspace_path == alt_workdir
+
+
 def test_board_param_routes_list_to_alt_board(multi_board_env):
     """kanban_list filters by the board parameter, not env-active."""
     from tools import kanban_tools as kt
@@ -1547,6 +1758,20 @@ def test_board_param_routes_show_to_alt_board(multi_board_env):
     good = json.loads(kt._handle_show({"task_id": alt_seed, "board": "alt"}))
     assert good["task"]["id"] == alt_seed
     assert good["task"]["title"] == "seed-alt"
+
+
+def test_board_param_overrides_env_db_pin_for_orchestrator(monkeypatch, multi_board_env):
+    """Explicit board should still work when HERMES_KANBAN_DB is pinned."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(multi_board_env["default_db"]))
+
+    alt_seed = multi_board_env["alt_seed"]
+    out = kt._handle_show({"task_id": alt_seed, "board": "alt"})
+    d = json.loads(out)
+    assert d.get("task", {}).get("id") == alt_seed, d
+    assert d["task"]["title"] == "seed-alt"
 
 
 def test_board_param_routes_assign_via_create_to_alt(multi_board_env):
@@ -1677,8 +1902,11 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
     # Seed the alt board with a claimed task.
     with kb.connect(board="alt") as conn:
         tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
 
     from tools import kanban_tools as kt
     out = kt._handle_heartbeat({"note": "alive on alt", "board": "alt"})
