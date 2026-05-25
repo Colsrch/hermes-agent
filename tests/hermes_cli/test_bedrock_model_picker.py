@@ -282,15 +282,18 @@ class TestBedrockRegionRouting:
     """End-to-end: region from botocore profile is used for discovery, so EU/AP
     users get eu.*/ap.* model IDs rather than the hardcoded us-east-1 list."""
 
-    def test_eu_region_from_botocore_profile_yields_eu_models(self):
+    def test_eu_region_from_botocore_profile_yields_eu_models(self, monkeypatch):
         """When botocore resolves eu-central-1, picker shows eu.* model IDs."""
         from hermes_cli.model_switch import list_authenticated_providers
 
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
         mock_session = MagicMock()
         mock_session.get_config_variable.return_value = "eu-central-1"
 
         with patch("agent.bedrock_adapter.has_aws_credentials", return_value=True), \
              patch("agent.bedrock_adapter.discover_bedrock_models", side_effect=_mock_discover), \
+             patch("hermes_cli.config.load_config", return_value={"bedrock": {"region": ""}}), \
              _mock_botocore_session(return_value=mock_session):
             providers = list_authenticated_providers(current_provider="bedrock")
 

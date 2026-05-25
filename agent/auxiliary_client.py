@@ -1100,6 +1100,74 @@ class AsyncAnthropicAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+class _BedrockConverseCompletionsAdapter:
+    def __init__(self, region: str, model: str):
+        self._region = region
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        from agent.bedrock_adapter import call_converse
+
+        stop = kwargs.get("stop")
+        if isinstance(stop, str):
+            stop_sequences = [stop]
+        elif isinstance(stop, list):
+            stop_sequences = stop
+        else:
+            stop_sequences = None
+
+        return call_converse(
+            region=self._region,
+            model=kwargs.get("model") or self._model,
+            messages=kwargs.get("messages", []),
+            tools=kwargs.get("tools"),
+            max_tokens=kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000,
+            temperature=kwargs.get("temperature"),
+            top_p=kwargs.get("top_p"),
+            stop_sequences=stop_sequences,
+        )
+
+
+class _BedrockConverseChatShim:
+    def __init__(self, adapter: _BedrockConverseCompletionsAdapter):
+        self.completions = adapter
+
+
+class BedrockConverseAuxiliaryClient:
+    """OpenAI-client-compatible wrapper over Bedrock Converse."""
+
+    def __init__(self, region: str, model: str):
+        self._region = region
+        self._model = model
+        adapter = _BedrockConverseCompletionsAdapter(region, model)
+        self.chat = _BedrockConverseChatShim(adapter)
+        self.api_key = "AWS_BEARER_TOKEN_BEDROCK"
+        self.base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+
+
+class _AsyncBedrockConverseCompletionsAdapter:
+    def __init__(self, sync_adapter: _BedrockConverseCompletionsAdapter):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncBedrockConverseChatShim:
+    def __init__(self, adapter: _AsyncBedrockConverseCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncBedrockConverseAuxiliaryClient:
+    def __init__(self, sync_wrapper: "BedrockConverseAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        async_adapter = _AsyncBedrockConverseCompletionsAdapter(sync_adapter)
+        self.chat = _AsyncBedrockConverseChatShim(async_adapter)
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+
+
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     """True if the endpoint at ``base_url`` speaks the Anthropic Messages
     protocol instead of OpenAI chat.completions.
@@ -3630,8 +3698,14 @@ def resolve_provider_client(
     elif pconfig.auth_type == "aws_sdk":
         # AWS SDK providers (Bedrock) — use the Anthropic Bedrock client via
         # boto3's credential chain (IAM roles, SSO, env vars, instance metadata).
+        # AWS_BEARER_TOKEN_BEDROCK is only valid for Bedrock Runtime/Converse
+        # requests; it is not an AnthropicBedrock SDK credential source.
         try:
-            from agent.bedrock_adapter import has_aws_credentials, resolve_bedrock_region
+            from agent.bedrock_adapter import (
+                has_aws_credentials,
+                resolve_aws_auth_env_var,
+                resolve_configured_bedrock_region,
+            )
             from agent.anthropic_adapter import build_anthropic_bedrock_client
         except ImportError:
             logger.warning("resolve_provider_client: bedrock requested but "
@@ -3643,9 +3717,20 @@ def resolve_provider_client(
                          "no AWS credentials found")
             return None, None
 
-        region = resolve_bedrock_region()
+        auth_source = resolve_aws_auth_env_var()
+        region = resolve_configured_bedrock_region()
         default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
         final_model = _normalize_resolved_model(model or default_model, provider)
+        if auth_source == "AWS_BEARER_TOKEN_BEDROCK":
+            logger.debug(
+                "resolve_provider_client: using Bedrock Converse auxiliary "
+                "client with bearer-token auth"
+            )
+            client = BedrockConverseAuxiliaryClient(region, final_model)
+            if async_mode:
+                return AsyncBedrockConverseAuxiliaryClient(client), final_model
+            return client, final_model
+
         try:
             real_client = build_anthropic_bedrock_client(region)
         except ImportError as exc:
@@ -4410,6 +4495,22 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     return {}
 
 
+def _missing_explicit_provider_credentials_error(provider: str) -> RuntimeError:
+    if provider == "bedrock":
+        return RuntimeError(
+            "Provider 'bedrock' is set in config.yaml but no Bedrock-compatible "
+            "credentials were found for this auxiliary task. Configure "
+            "AWS_BEARER_TOKEN_BEDROCK in ~/.hermes/.env for Bedrock Runtime "
+            "API-key auth, or configure AWS credentials such as AWS_PROFILE, "
+            "AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY, or an IAM role."
+        )
+    return RuntimeError(
+        f"Provider '{provider}' is set in config.yaml but no API key "
+        f"was found. Set the {provider.upper()}_API_KEY environment "
+        f"variable, or switch to a different provider with `hermes model`."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Anthropic-compatible endpoint detection + image block conversion
 # ---------------------------------------------------------------------------
@@ -4682,11 +4783,7 @@ def call_llm(
             # through OpenRouter (which causes confusing 404s).
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                raise RuntimeError(
-                    f"Provider '{_explicit}' is set in config.yaml but no API key "
-                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                    f"variable, or switch to a different provider with `hermes model`."
-                )
+                raise _missing_explicit_provider_credentials_error(_explicit)
             # For auto/custom with no credentials, try the full auto chain
             # rather than hardcoding OpenRouter (which may be depleted).
             # Pass model=None so each provider uses its own default —
@@ -5081,11 +5178,7 @@ async def async_call_llm(
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                raise RuntimeError(
-                    f"Provider '{_explicit}' is set in config.yaml but no API key "
-                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                    f"variable, or switch to a different provider with `hermes model`."
-                )
+                raise _missing_explicit_provider_credentials_error(_explicit)
             if not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)

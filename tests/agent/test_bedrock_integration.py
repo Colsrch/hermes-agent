@@ -10,6 +10,7 @@ require Python 3.10+ due to ``str | None`` type syntax in the import chain.
 """
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -202,6 +203,94 @@ class TestRuntimeProvider:
             result = resolve_runtime_provider(requested="bedrock")
         assert result["provider"] == "bedrock"
         assert result["api_mode"] == "bedrock_converse"
+
+    def test_bedrock_runtime_bearer_token_uses_converse_for_claude(self, monkeypatch):
+        """Bedrock bearer tokens are for the Runtime API, not AnthropicBedrock."""
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"]:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-runtime-token")
+
+        with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
+             patch("hermes_cli.runtime_provider.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("hermes_cli.runtime_provider._get_model_config",
+                   return_value={
+                       "provider": "bedrock",
+                       "default": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                   }):
+            result = resolve_runtime_provider(requested="bedrock")
+
+        assert result["provider"] == "bedrock"
+        assert result["api_mode"] == "bedrock_converse"
+        assert result["source"] == "AWS_BEARER_TOKEN_BEDROCK"
+        assert "bedrock_anthropic" not in result
+
+    def test_bedrock_runtime_bearer_token_from_dotenv_uses_converse_for_claude(self, monkeypatch):
+        """Long-running entrypoints may have only ~/.hermes/.env as the source."""
+        from hermes_cli.config import invalidate_env_cache
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
+                    "AWS_BEARER_TOKEN_BEDROCK"]:
+            monkeypatch.delenv(var, raising=False)
+        home = Path(os.environ["HERMES_HOME"])
+        (home / ".env").write_text(
+            "AWS_BEARER_TOKEN_BEDROCK=bedrock-runtime-token\n",
+            encoding="utf-8",
+        )
+        invalidate_env_cache()
+
+        with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
+             patch("hermes_cli.runtime_provider.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("hermes_cli.runtime_provider._get_model_config",
+                   return_value={
+                       "provider": "bedrock",
+                       "default": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                   }):
+            result = resolve_runtime_provider(requested="bedrock")
+
+        assert result["api_mode"] == "bedrock_converse"
+        assert result["source"] == "AWS_BEARER_TOKEN_BEDROCK"
+        assert "bedrock_anthropic" not in result
+
+    def test_bedrock_runtime_access_keys_keep_anthropic_sdk_for_claude(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+        with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
+             patch("hermes_cli.runtime_provider.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("hermes_cli.runtime_provider._get_model_config",
+                   return_value={
+                       "provider": "bedrock",
+                       "default": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                   }):
+            result = resolve_runtime_provider(requested="bedrock")
+
+        assert result["api_mode"] == "anthropic_messages"
+        assert result["bedrock_anthropic"] is True
+
+    def test_bedrock_runtime_config_region_overrides_env(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        monkeypatch.setenv("AWS_REGION", "us-west-1")
+
+        with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
+             patch("hermes_cli.runtime_provider.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}):
+            result = resolve_runtime_provider(requested="bedrock")
+
+        assert result["region"] == "us-east-1"
+        assert "bedrock-runtime.us-east-1.amazonaws.com" in result["base_url"]
 
 
 # ---------------------------------------------------------------------------
@@ -512,12 +601,15 @@ class TestAuxiliaryClientBedrockResolution:
 
     def test_bedrock_returns_client_with_credentials(self, monkeypatch):
         """With valid AWS credentials, Bedrock should return a usable client."""
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
         monkeypatch.setenv("AWS_REGION", "us-west-2")
 
         mock_anthropic_bedrock = MagicMock()
-        with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": ""}}), \
+             patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
                    return_value=mock_anthropic_bedrock):
             from agent.auxiliary_client import resolve_provider_client, AnthropicAuxiliaryClient
             client, model = resolve_provider_client("bedrock", None)
@@ -531,6 +623,53 @@ class TestAuxiliaryClientBedrockResolution:
         assert client.api_key == "aws-sdk"
         assert "us-west-2" in client.base_url
 
+    def test_bedrock_bearer_only_uses_converse_auxiliary_client(self, monkeypatch):
+        """Bearer-only Bedrock auth should use Converse, not AnthropicBedrock."""
+        for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"]:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-runtime-token")
+
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("agent.anthropic_adapter.build_anthropic_bedrock_client") as build_client:
+            from agent.auxiliary_client import (
+                BedrockConverseAuxiliaryClient,
+                resolve_provider_client,
+            )
+
+            client, model = resolve_provider_client("bedrock", None)
+
+        assert isinstance(client, BedrockConverseAuxiliaryClient)
+        assert model is not None
+        assert client.api_key == "AWS_BEARER_TOKEN_BEDROCK"
+        assert "bedrock-runtime.us-east-1.amazonaws.com" in client.base_url
+        build_client.assert_not_called()
+
+    def test_bedrock_converse_auxiliary_create_calls_converse(self, monkeypatch):
+        for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"]:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-runtime-token")
+
+        fake_response = MagicMock()
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("agent.bedrock_adapter.call_converse", return_value=fake_response) as call_converse:
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client("bedrock", "anthropic.claude-haiku-4-5-20251001-v1:0")
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=128,
+            )
+
+        assert response is fake_response
+        call_converse.assert_called_once()
+        _, kwargs = call_converse.call_args
+        assert kwargs["region"] == "us-east-1"
+        assert kwargs["model"] == "anthropic.claude-haiku-4-5-20251001-v1:0"
+        assert kwargs["max_tokens"] == 128
+
     def test_bedrock_returns_none_without_credentials(self, monkeypatch):
         """Without AWS credentials, Bedrock should return (None, None) gracefully."""
         with patch("agent.bedrock_adapter.has_aws_credentials", return_value=False):
@@ -542,11 +681,14 @@ class TestAuxiliaryClientBedrockResolution:
 
     def test_bedrock_uses_configured_region(self, monkeypatch):
         """Bedrock client base_url should reflect AWS_REGION."""
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
         monkeypatch.setenv("AWS_REGION", "eu-central-1")
 
-        with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": ""}}), \
+             patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
                    return_value=MagicMock()):
             from agent.auxiliary_client import resolve_provider_client
             client, _ = resolve_provider_client("bedrock", None)
@@ -554,8 +696,27 @@ class TestAuxiliaryClientBedrockResolution:
         assert client is not None
         assert "eu-central-1" in client.base_url
 
+    def test_bedrock_config_region_overrides_env(self, monkeypatch):
+        """bedrock.region should override AWS_REGION for auxiliary clients."""
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        monkeypatch.setenv("AWS_REGION", "us-west-1")
+
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": "us-east-1", "guardrail": {}}}), \
+             patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
+                   return_value=MagicMock()) as build_client:
+            from agent.auxiliary_client import resolve_provider_client
+            client, _ = resolve_provider_client("bedrock", None)
+
+        assert client is not None
+        build_client.assert_called_once_with("us-east-1")
+        assert "bedrock-runtime.us-east-1.amazonaws.com" in client.base_url
+
     def test_bedrock_respects_explicit_model(self, monkeypatch):
         """When caller passes an explicit model, it should be used."""
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
@@ -570,6 +731,7 @@ class TestAuxiliaryClientBedrockResolution:
 
     def test_bedrock_async_mode(self, monkeypatch):
         """Async mode should return an AsyncAnthropicAuxiliaryClient."""
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
@@ -583,6 +745,7 @@ class TestAuxiliaryClientBedrockResolution:
 
     def test_bedrock_default_model_is_haiku(self, monkeypatch):
         """Default auxiliary model for Bedrock should be Haiku (fast, cheap)."""
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 

@@ -1552,8 +1552,7 @@ def resolve_runtime_provider(
             )
         # Read bedrock-specific config from config.yaml
         _bedrock_cfg = load_config().get("bedrock", {})
-        # Region priority: config.yaml bedrock.region → env var → us-east-1
-        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
+        region = resolve_bedrock_region(config_region=_bedrock_cfg.get("region"))
         auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
         # Build guardrail config if configured
         _gr = _bedrock_cfg.get("guardrail", {})
@@ -1567,11 +1566,16 @@ def resolve_runtime_provider(
                 guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
             if _gr.get("trace"):
                 guardrail_config["trace"] = _gr["trace"]
-        # Dual-path routing: Claude models use AnthropicBedrock SDK for full
+        # Dual-path routing: Claude models usually use AnthropicBedrock SDK for
         # feature parity (prompt caching, thinking budgets, adaptive thinking).
-        # Non-Claude models use the Converse API for multi-model support.
+        # AWS_BEARER_TOKEN_BEDROCK is a Bedrock Runtime bearer token, not an
+        # AnthropicBedrock SDK credential source, so bearer-token auth must stay
+        # on the native Converse API path.
         _current_model = str(model_cfg.get("default") or "").strip()
-        if is_anthropic_bedrock_model(_current_model):
+        if (
+            is_anthropic_bedrock_model(_current_model)
+            and auth_source != "AWS_BEARER_TOKEN_BEDROCK"
+        ):
             # Claude on Bedrock → AnthropicBedrock SDK → anthropic_messages path
             runtime = {
                 "provider": "bedrock",

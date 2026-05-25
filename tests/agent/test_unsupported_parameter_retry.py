@@ -140,3 +140,22 @@ class TestMaxTokensRetryHardening:
 
         assert client.chat.completions.create.call_count == 1
 
+
+class TestAuxiliaryProviderCredentialErrors:
+    def test_bedrock_error_mentions_aws_credentials_not_bedrock_api_key(self):
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("bedrock", "anthropic.claude-3-5-sonnet-20241022-v2:0", None, None, None),
+            ),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(None, None)),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                call_llm(
+                    task="title",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+        message = str(exc_info.value)
+        assert "AWS_BEARER_TOKEN_BEDROCK" in message
+        assert "BEDROCK_API_KEY" not in message

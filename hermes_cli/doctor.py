@@ -1591,14 +1591,14 @@ def run_doctor(args):
             from agent.bedrock_adapter import (
                 has_aws_credentials,
                 resolve_aws_auth_env_var,
-                resolve_bedrock_region,
+                resolve_configured_bedrock_region,
             )
         except ImportError:
             return _ConnectivityResult("AWS Bedrock", [], [])
         if not has_aws_credentials():
             return _ConnectivityResult("AWS Bedrock", [], [])
         auth_var = resolve_aws_auth_env_var()
-        region = resolve_bedrock_region()
+        region = resolve_configured_bedrock_region()
         label = "AWS Bedrock".ljust(20)
         try:
             import boto3
