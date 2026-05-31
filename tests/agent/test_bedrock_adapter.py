@@ -1291,6 +1291,90 @@ class TestInvalidateRuntimeClient:
         reset_client_cache()
         assert invalidate_runtime_client("eu-west-1") is False
 
+    def test_evicts_all_bearer_token_clients_for_region(self):
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            reset_client_cache,
+        )
+        reset_client_cache()
+        _bedrock_runtime_client_cache[("us-east-1", "bearer", "old")] = "old-client"
+        _bedrock_runtime_client_cache[("us-east-1", "bearer", "new")] = "new-client"
+        _bedrock_runtime_client_cache[("us-west-2", "bearer", "old")] = "other-region"
+
+        evicted = invalidate_runtime_client("us-east-1")
+
+        assert evicted is True
+        assert ("us-east-1", "bearer", "old") not in _bedrock_runtime_client_cache
+        assert ("us-east-1", "bearer", "new") not in _bedrock_runtime_client_cache
+        assert _bedrock_runtime_client_cache[("us-west-2", "bearer", "old")] == "other-region"
+
+
+class TestBedrockBearerRuntimeClient:
+    """Bearer-token Bedrock API keys use unsigned boto3 requests plus auth header injection."""
+
+    def _fake_botocore_modules(self):
+        unsigned = object()
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.signature_version = kwargs.get("signature_version")
+
+        botocore_mod = ModuleType("botocore")
+        botocore_mod.UNSIGNED = unsigned
+        config_mod = ModuleType("botocore.config")
+        config_mod.Config = FakeConfig
+        return unsigned, {"botocore": botocore_mod, "botocore.config": config_mod}
+
+    def test_bearer_token_uses_unsigned_config_and_injects_authorization(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        bedrock_adapter.reset_client_cache()
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-key-123")
+        unsigned, modules = self._fake_botocore_modules()
+        events = MagicMock()
+        fake_client = SimpleNamespace(meta=SimpleNamespace(events=events))
+        fake_boto3 = SimpleNamespace(client=MagicMock(return_value=fake_client))
+
+        with patch.dict("sys.modules", modules), \
+             patch("agent.bedrock_adapter._require_boto3", return_value=fake_boto3):
+            client = bedrock_adapter._get_bedrock_runtime_client("us-east-1")
+
+        assert client is fake_client
+        call_kwargs = fake_boto3.client.call_args.kwargs
+        assert call_kwargs["region_name"] == "us-east-1"
+        assert call_kwargs["config"].signature_version is unsigned
+
+        registered = {call.args[0]: call.args[1] for call in events.register.call_args_list}
+        params = {"headers": {}}
+        registered["before-call.bedrock-runtime.Converse"](params=params)
+        assert params["headers"]["Authorization"] == "Bearer bedrock-key-123"
+
+        stream_params = {"headers": {}}
+        registered["before-call.bedrock-runtime.ConverseStream"](params=stream_params)
+        assert stream_params["headers"]["Authorization"] == "Bearer bedrock-key-123"
+
+    def test_bearer_token_rotation_creates_a_fresh_cached_client(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        bedrock_adapter.reset_client_cache()
+        unsigned, modules = self._fake_botocore_modules()
+        client_one = SimpleNamespace(meta=SimpleNamespace(events=MagicMock()))
+        client_two = SimpleNamespace(meta=SimpleNamespace(events=MagicMock()))
+        fake_boto3 = SimpleNamespace(client=MagicMock(side_effect=[client_one, client_two]))
+
+        with patch.dict("sys.modules", modules), \
+             patch("agent.bedrock_adapter._require_boto3", return_value=fake_boto3):
+            monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "first-token")
+            first = bedrock_adapter._get_bedrock_runtime_client("us-east-1")
+            monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "second-token")
+            second = bedrock_adapter._get_bedrock_runtime_client("us-east-1")
+
+        assert first is client_one
+        assert second is client_two
+        assert fake_boto3.client.call_count == 2
+
 
 class TestIsStaleConnectionError:
     """Classifier that decides whether an exception warrants client eviction."""

@@ -1567,11 +1567,15 @@ def resolve_runtime_provider(
                 guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
             if _gr.get("trace"):
                 guardrail_config["trace"] = _gr["trace"]
-        # Dual-path routing: Claude models use AnthropicBedrock SDK for full
-        # feature parity (prompt caching, thinking budgets, adaptive thinking).
-        # Non-Claude models use the Converse API for multi-model support.
+        # Dual-path routing: Claude models normally use AnthropicBedrock SDK
+        # for full feature parity. Bedrock bearer API keys cannot authenticate
+        # that SDK path, so route them through native Converse where
+        # bedrock_adapter injects the bearer Authorization header.
         _current_model = str(model_cfg.get("default") or "").strip()
-        if is_anthropic_bedrock_model(_current_model):
+        if (
+            auth_source != "AWS_BEARER_TOKEN_BEDROCK"
+            and is_anthropic_bedrock_model(_current_model)
+        ):
             # Claude on Bedrock → AnthropicBedrock SDK → anthropic_messages path
             runtime = {
                 "provider": "bedrock",

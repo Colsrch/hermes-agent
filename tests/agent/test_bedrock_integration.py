@@ -163,6 +163,26 @@ class TestRuntimeProvider:
 
         assert result["region"] == "us-east-1"
 
+    def test_bedrock_bearer_token_forces_converse_even_for_claude(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+
+        with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
+             patch("hermes_cli.runtime_provider._get_model_config", return_value={
+                 "provider": "bedrock",
+                 "default": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+             }):
+            result = resolve_runtime_provider(requested="bedrock")
+
+        assert result["provider"] == "bedrock"
+        assert result["source"] == "AWS_BEARER_TOKEN_BEDROCK"
+        assert result["api_mode"] == "bedrock_converse"
+        assert "bedrock_anthropic" not in result
+
     def test_bedrock_runtime_no_credentials_raises_on_auto_detect(self, monkeypatch):
         """When bedrock is auto-detected (not explicitly requested) and no
         credentials are found, runtime resolution should raise AuthError."""
@@ -592,3 +612,36 @@ class TestAuxiliaryClientBedrockResolution:
             _, model = resolve_provider_client("bedrock", None)
 
         assert "haiku" in model.lower()
+
+    def test_bedrock_bearer_token_uses_converse_auxiliary_client(self, monkeypatch):
+        """Bedrock API keys cannot authenticate AnthropicBedrock; use Converse."""
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+        monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+
+        with patch("agent.anthropic_adapter.build_anthropic_bedrock_client") as anthropic_bedrock:
+            from agent.auxiliary_client import resolve_provider_client, BedrockConverseAuxiliaryClient
+            client, model = resolve_provider_client("bedrock", None)
+
+        anthropic_bedrock.assert_not_called()
+        assert isinstance(client, BedrockConverseAuxiliaryClient)
+        assert model is not None
+        assert client.api_key == "bedrock-bearer"
+        assert "ap-southeast-2" in client.base_url
+
+    def test_bedrock_auxiliary_region_prefers_config_over_env(self, monkeypatch):
+        """Auxiliary Bedrock should mirror runtime_provider's bedrock.region priority."""
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+
+        with patch("hermes_cli.config.load_config",
+                   return_value={"bedrock": {"region": "eu-central-1"}}), \
+             patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
+                   return_value=MagicMock()):
+            from agent.auxiliary_client import resolve_provider_client
+            client, _ = resolve_provider_client("bedrock", None)
+
+        assert client is not None
+        assert "eu-central-1" in client.base_url
