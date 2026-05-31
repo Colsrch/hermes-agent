@@ -664,6 +664,28 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
+    delivery, bool_error = _parse_bool_arg(args, "delivery")
+    if bool_error:
+        return tool_error(bool_error)
+    delivery_context: dict[str, str] = {}
+    if delivery:
+        from gateway.session_context import get_session_env
+
+        delivery_context = {
+            "session_key": get_session_env("HERMES_SESSION_KEY", ""),
+            "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+            "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+            "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+        }
+        if not (
+            delivery_context["session_key"]
+            and delivery_context["platform"]
+            and delivery_context["chat_id"]
+        ):
+            return tool_error(
+                "delivery requires gateway session context "
+                "(HERMES_SESSION_KEY, HERMES_SESSION_PLATFORM, HERMES_SESSION_CHAT_ID)"
+            )
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -706,6 +728,17 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            if delivery:
+                kb.add_notify_sub(
+                    conn,
+                    task_id=new_tid,
+                    platform=delivery_context["platform"],
+                    chat_id=delivery_context["chat_id"],
+                    thread_id=delivery_context["thread_id"] or "",
+                    notifier_profile=os.environ.get("HERMES_PROFILE"),
+                    delivery_mode="agent",
+                    session_key=delivery_context["session_key"],
+                )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1125,6 +1158,14 @@ KANBAN_CREATE_SCHEMA = {
                     "If true, task lands in 'triage' instead of 'todo' "
                     "— a specifier profile is expected to flesh out "
                     "the body before work starts."
+                ),
+            },
+            "delivery": {
+                "type": "boolean",
+                "description": (
+                    "When true from a gateway-hosted agent session, inject "
+                    "a synthetic message back into this same session when "
+                    "the task completes or blocks."
                 ),
             },
             "idempotency_key": {

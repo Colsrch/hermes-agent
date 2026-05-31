@@ -791,6 +791,61 @@ def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_delivery_registers_gateway_session_on_notify_sub(monkeypatch, worker_env):
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:chat-1:topic-1")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "topic-1")
+    monkeypatch.setenv("HERMES_PROFILE", "gateway-profile")
+
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "deliver back",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "delivery": True,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "agent"
+    assert subs[0]["session_key"] == "agent:main:telegram:dm:chat-1:topic-1"
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat-1"
+    assert subs[0]["thread_id"] == "topic-1"
+    assert subs[0]["notifier_profile"] == "gateway-profile"
+
+
+def test_create_delivery_rejects_missing_gateway_session(monkeypatch, worker_env):
+    for name in (
+        "HERMES_SESSION_KEY",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "missing delivery context",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "delivery": True,
+    })
+
+    assert "delivery requires gateway session context" in json.loads(out).get("error", "")
+
+
 def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
     """An explicit ``session_id`` arg from the model wins over the env
     propagation. Edge case but exercised: a tool call could carry a
