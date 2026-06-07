@@ -249,6 +249,30 @@ def test_terminal_task_cwd_ssh_sentinel_cwd_falls_back_to_session(monkeypatch):
     assert server._terminal_task_cwd({"cwd": "/host/session/dir"}) == "/host/session/dir"
 
 
+def test_session_context_sets_tui_delivery_identity(monkeypatch, tmp_path):
+    from gateway.session_context import get_session_env
+
+    sid = "delivery-sid"
+    session_key = "delivery-session-key"
+    project = tmp_path / "project"
+    project.mkdir()
+
+    server._sessions[sid] = {
+        "session_key": session_key,
+        "delivery_key": "stable-delivery-key",
+        "cwd": str(project),
+    }
+
+    tokens = server._set_session_context(session_key)
+    try:
+        assert get_session_env("HERMES_SESSION_DELIVERY_PLATFORM") == "tui"
+        assert get_session_env("HERMES_SESSION_DELIVERY_CHAT_ID") == "stable-delivery-key"
+        assert get_session_env("HERMES_SESSION_DELIVERY_THREAD_ID") == ""
+    finally:
+        server._clear_session_context(tokens)
+        server._sessions.pop(sid, None)
+
+
 class _ChunkyStdout:
     def __init__(self):
         self.parts: list[str] = []
@@ -7124,6 +7148,130 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def _init_tui_kanban_delivery_db(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return kb
+
+
+def test_tui_kanban_delivery_poller_delivers_completed_task(monkeypatch, tmp_path):
+    kb = _init_tui_kanban_delivery_db(monkeypatch, tmp_path)
+    delivery_key = "stable-delivery-key"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="desktop delivery", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id=delivery_key,
+            delivery_mode="agent",
+            session_key="old-compressed-session-key",
+        )
+        assert kb.complete_task(conn, tid, summary="desktop summary")
+    finally:
+        conn.close()
+
+    turns = []
+    emitted = []
+
+    def _fake_run_prompt_submit(_rid, _sid, session, text):
+        turns.append(text)
+        with session["history_lock"]:
+            session["running"] = False
+
+    sess = _session(session_key="new-compressed-session-key", delivery_key=delivery_key)
+    server._sessions["sid_kanban"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
+    monkeypatch.setattr(server, "_run_prompt_submit", _fake_run_prompt_submit)
+
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._tui_kanban_delivery_poller_loop(stop, "sid_kanban", sess)
+
+        assert len(turns) == 1
+        assert f"[Kanban task {tid} completed - desktop delivery." in turns[0]
+        assert "Summary: desktop summary" in turns[0]
+        assert any(a[0] == "status.update" and a[2]["kind"] == "kanban" for a in emitted)
+
+        conn = kb.connect()
+        try:
+            assert kb.list_notify_subs(conn, tid) == []
+        finally:
+            conn.close()
+    finally:
+        server._sessions.pop("sid_kanban", None)
+
+
+def test_tui_kanban_delivery_poller_rewinds_when_session_busy(monkeypatch, tmp_path):
+    kb = _init_tui_kanban_delivery_db(monkeypatch, tmp_path)
+    delivery_key = "busy-delivery-key"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="busy delivery", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id=delivery_key,
+            delivery_mode="agent",
+            session_key="busy-session-key",
+        )
+        assert kb.complete_task(conn, tid, summary="retry later")
+    finally:
+        conn.close()
+
+    turns = []
+    sess = _session(running=True, delivery_key=delivery_key)
+    server._sessions["sid_kanban_busy"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **kw: turns.append(a))
+
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._tui_kanban_delivery_poller_loop(stop, "sid_kanban_busy", sess)
+
+        assert turns == []
+        conn = kb.connect()
+        try:
+            subs = kb.list_notify_subs(conn, tid)
+            assert len(subs) == 1
+            assert subs[0]["last_event_id"] == 0
+            _old, _new, events = kb.claim_unseen_events_for_sub(
+                conn,
+                task_id=tid,
+                platform="tui",
+                chat_id=delivery_key,
+                kinds=("completed", "blocked"),
+            )
+            assert [ev.kind for ev in events] == ["completed"]
+        finally:
+            conn.close()
+    finally:
+        server._sessions.pop("sid_kanban_busy", None)
+
+
+def test_finalize_session_stops_kanban_delivery_poller():
+    stop = threading.Event()
+    sess = _session(_kanban_delivery_stop=stop)
+
+    server._finalize_session(sess)
+
+    assert stop.is_set()
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):

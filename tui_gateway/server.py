@@ -389,6 +389,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
+    kanban_stop_event = session.get("_kanban_delivery_stop")
+    if kanban_stop_event is not None:
+        kanban_stop_event.set()
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -1008,6 +1011,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+                    _sessions[sid]["_kanban_delivery_stop"] = (
+                        _start_tui_kanban_delivery_poller(sid, _sessions[sid])
+                    )
             _notify_session_boundary("on_session_reset", key)
 
             info = _session_info(agent, current)
@@ -1415,8 +1421,35 @@ def _set_session_context(session_key: str, cwd: str | None = None) -> list:
         # reverse-map returns "" and would clear the cwd override. Callers that
         # know the parent workspace pass it explicitly so spawned agents inherit
         # it instead of falling back to the gateway launch dir.
-        resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
-        return set_session_vars(session_key=session_key, cwd=resolved)
+        session = None
+        if session_key:
+            with _sessions_lock:
+                for candidate in list(_sessions.values()):
+                    if candidate.get("session_key") == session_key:
+                        session = candidate
+                        break
+        resolved = (
+            cwd
+            if cwd is not None
+            else str(session.get("cwd") or "") if session is not None else _cwd_for_session_key(session_key)
+        )
+        delivery_key = ""
+        delivery_thread_id = ""
+        if session is not None:
+            delivery_key = str(
+                session.get("delivery_key")
+                or session.get("session_key")
+                or session_key
+                or ""
+            ).strip()
+            delivery_thread_id = str(session.get("delivery_thread_id") or "").strip()
+        return set_session_vars(
+            session_key=session_key,
+            cwd=resolved,
+            delivery_platform="tui" if delivery_key else "",
+            delivery_chat_id=delivery_key,
+            delivery_thread_id=delivery_thread_id,
+        )
     except Exception:
         return []
 
@@ -3754,6 +3787,7 @@ def _init_session(
             "history_version": 0,
             "inflight_turn": None,
             "created_at": now,
+            "delivery_key": key,
             "last_active": now,
             "running": False,
             "attached_images": [],
@@ -3823,6 +3857,9 @@ def _init_session(
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+            _sessions[sid]["_kanban_delivery_stop"] = (
+                _start_tui_kanban_delivery_poller(sid, _sessions[sid])
+            )
     _notify_session_boundary("on_session_reset", key)
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
@@ -4231,6 +4268,7 @@ def _(rid, params: dict) -> dict:
             "active_session_lease": lease,
             "cols": cols,
             "created_at": now,
+            "delivery_key": key,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
             "history": history,
@@ -6334,6 +6372,277 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     stop = threading.Event()
     t = threading.Thread(
         target=_notification_poller_loop,
+        args=(stop, sid, session),
+        daemon=True,
+    )
+    t.start()
+    return stop
+
+
+_TUI_KANBAN_DELIVERY_PLATFORM = "tui"
+_TUI_KANBAN_DELIVERY_KINDS = ("completed", "blocked")
+
+try:
+    _TUI_KANBAN_DELIVERY_POLL_INTERVAL_S = max(
+        0.5, float(os.environ.get("HERMES_TUI_KANBAN_DELIVERY_POLL_INTERVAL_S") or "2.0")
+    )
+except (TypeError, ValueError):
+    _TUI_KANBAN_DELIVERY_POLL_INTERVAL_S = 2.0
+
+
+def _tui_delivery_key(session: dict) -> str:
+    return str(
+        session.get("delivery_key")
+        or session.get("session_key")
+        or ""
+    ).strip()
+
+
+def _tui_kanban_delivery_text(sub: dict, task, event) -> str:
+    title = (task.title if task else sub.get("task_id", ""))[:120]
+    task_id = sub.get("task_id", "")
+    if event.kind == "completed":
+        summary = ""
+        if event.payload and event.payload.get("summary"):
+            summary = str(event.payload["summary"]).strip()
+        elif task and task.result:
+            summary = str(task.result).strip()
+        summary = summary[:500] if summary else "(no summary provided)"
+        return (
+            f"[Kanban task {task_id} completed - {title}.\n"
+            f"Summary: {summary}]"
+        )
+    if event.kind == "blocked":
+        reason = ""
+        if event.payload and event.payload.get("reason"):
+            reason = str(event.payload["reason"]).strip()
+        reason = reason[:300] if reason else "(no reason given)"
+        return (
+            f"[Kanban task {task_id} blocked - {title}.\n"
+            f"Reason: {reason}]"
+        )
+    return ""
+
+
+def _tui_kanban_connect(board: str | None = None):
+    from hermes_cli import kanban_db as _kb
+
+    return _kb, _kb.connect(board=board)
+
+
+def _tui_kanban_advance(sub: dict, cursor: int, board: str | None = None) -> None:
+    _kb, conn = _tui_kanban_connect(board)
+    try:
+        _kb.advance_notify_cursor(
+            conn,
+            task_id=sub["task_id"],
+            platform=sub["platform"],
+            chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "",
+            new_cursor=cursor,
+        )
+    finally:
+        conn.close()
+
+
+def _tui_kanban_rewind(
+    sub: dict,
+    claimed_cursor: int,
+    old_cursor: int,
+    board: str | None = None,
+) -> None:
+    _kb, conn = _tui_kanban_connect(board)
+    try:
+        _kb.rewind_notify_cursor(
+            conn,
+            task_id=sub["task_id"],
+            platform=sub["platform"],
+            chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "",
+            claimed_cursor=claimed_cursor,
+            old_cursor=old_cursor,
+        )
+    finally:
+        conn.close()
+
+
+def _tui_kanban_unsub(sub: dict, board: str | None = None) -> None:
+    _kb, conn = _tui_kanban_connect(board)
+    try:
+        _kb.remove_notify_sub(
+            conn,
+            task_id=sub["task_id"],
+            platform=sub["platform"],
+            chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "",
+        )
+    finally:
+        conn.close()
+
+
+def _collect_tui_kanban_deliveries(session: dict) -> list[dict]:
+    delivery_key = _tui_delivery_key(session)
+    if not delivery_key:
+        return []
+
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        logger.debug("tui kanban delivery: kanban_db unavailable", exc_info=True)
+        return []
+
+    deliveries: list[dict] = []
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        try:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+        except Exception:
+            boards = [{"slug": _kb.DEFAULT_BOARD, "db_path": None}]
+
+    seen_db_paths: set[str] = set()
+    for board_meta in boards:
+        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+        db_path = board_meta.get("db_path")
+        try:
+            resolved_db_path = (
+                str(Path(db_path).expanduser().resolve())
+                if db_path
+                else str(_kb.kanban_db_path(slug).resolve())
+            )
+        except Exception:
+            resolved_db_path = f"slug:{slug}"
+        if resolved_db_path in seen_db_paths:
+            continue
+        seen_db_paths.add(resolved_db_path)
+
+        try:
+            conn = _kb.connect(board=slug)
+        except Exception:
+            logger.debug("tui kanban delivery: cannot open board %s", slug, exc_info=True)
+            continue
+        try:
+            for sub in _kb.list_notify_subs(conn):
+                if (sub.get("platform") or "").lower() != _TUI_KANBAN_DELIVERY_PLATFORM:
+                    continue
+                if (sub.get("delivery_mode") or "notify") != "agent":
+                    continue
+                if str(sub.get("chat_id") or "") != delivery_key:
+                    continue
+                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    kinds=_TUI_KANBAN_DELIVERY_KINDS,
+                )
+                if not events:
+                    continue
+                task = _kb.get_task(conn, sub["task_id"])
+                deliveries.append({
+                    "sub": sub,
+                    "old_cursor": old_cursor,
+                    "cursor": cursor,
+                    "events": events,
+                    "task": task,
+                    "board": slug,
+                })
+        finally:
+            conn.close()
+    return deliveries
+
+
+def _poll_tui_kanban_deliveries_once(sid: str, session: dict) -> None:
+    home_token = None
+    profile_home = session.get("profile_home")
+    if profile_home:
+        home_token = set_hermes_home_override(str(profile_home))
+    try:
+        deliveries = _collect_tui_kanban_deliveries(session)
+        for delivery in deliveries:
+            sub = delivery["sub"]
+            board = delivery.get("board")
+            texts = [
+                text for text in (
+                    _tui_kanban_delivery_text(sub, delivery.get("task"), event)
+                    for event in delivery["events"]
+                )
+                if text
+            ]
+            if not texts:
+                _tui_kanban_advance(sub, delivery["cursor"], board)
+                _tui_kanban_unsub(sub, board)
+                continue
+
+            text = "\n\n".join(texts)
+            with session["history_lock"]:
+                if session.get("running"):
+                    _tui_kanban_rewind(
+                        sub,
+                        delivery["cursor"],
+                        delivery.get("old_cursor", 0),
+                        board,
+                    )
+                    continue
+                session["running"] = True
+
+            rid = f"__kanban_delivery__{int(time.time() * 1000)}"
+            try:
+                _emit("status.update", sid, {"kind": "kanban", "text": text})
+                _run_prompt_submit(rid, sid, session, text)
+            except Exception as exc:
+                logger.warning(
+                    "tui kanban delivery: dispatch failed for %s: %s",
+                    sub.get("task_id"),
+                    exc,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+                _tui_kanban_rewind(
+                    sub,
+                    delivery["cursor"],
+                    delivery.get("old_cursor", 0),
+                    board,
+                )
+                continue
+
+            _tui_kanban_advance(sub, delivery["cursor"], board)
+            _tui_kanban_unsub(sub, board)
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _tui_kanban_delivery_poller_loop(
+    stop_event: threading.Event,
+    sid: str,
+    session: dict,
+) -> None:
+    if session.get("_finalized"):
+        return
+
+    first = True
+    while first or (not stop_event.is_set() and not session.get("_finalized")):
+        first = False
+        try:
+            _poll_tui_kanban_deliveries_once(sid, session)
+        except Exception as exc:
+            print(
+                f"[tui_gateway] kanban delivery poller failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        if stop_event.is_set() or session.get("_finalized"):
+            break
+        stop_event.wait(_TUI_KANBAN_DELIVERY_POLL_INTERVAL_S)
+
+
+def _start_tui_kanban_delivery_poller(sid: str, session: dict) -> threading.Event:
+    """Start the kanban delivery poller for a live TUI/Desktop session."""
+    stop = threading.Event()
+    t = threading.Thread(
+        target=_tui_kanban_delivery_poller_loop,
         args=(stop, sid, session),
         daemon=True,
     )
