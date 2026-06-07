@@ -27,6 +27,7 @@ the same Converse API integration in TypeScript via ``@aws-sdk/client-bedrock``.
 Requires: ``boto3`` (optional dependency — only needed when using the Bedrock provider).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -54,7 +55,7 @@ except Exception:
 # This keeps startup fast for users who don't use Bedrock.
 # ---------------------------------------------------------------------------
 
-_bedrock_runtime_client_cache: Dict[str, Any] = {}
+_bedrock_runtime_client_cache: Dict[Any, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
 
 
@@ -88,17 +89,73 @@ def _require_boto3():
     return boto3
 
 
+def _bedrock_bearer_token(env: Optional[Dict[str, str]] = None) -> str:
+    """Return the Bedrock bearer token, if configured."""
+    env = env if env is not None else os.environ
+    return (env.get("AWS_BEARER_TOKEN_BEDROCK") or "").strip()
+
+
+def _bearer_token_fingerprint(token: str) -> str:
+    """Stable, non-secret cache discriminator for Bedrock bearer tokens."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _runtime_client_cache_key(region: str, bearer_token: str = "") -> Any:
+    if bearer_token:
+        return (region, "bearer", _bearer_token_fingerprint(bearer_token))
+    return region
+
+
+def _runtime_client_cache_key_region(cache_key: Any) -> Optional[str]:
+    if isinstance(cache_key, tuple) and cache_key:
+        return str(cache_key[0])
+    if isinstance(cache_key, str):
+        return cache_key
+    return None
+
+
+def _register_bedrock_bearer_auth(client: Any, bearer_token: str) -> None:
+    """Inject Bedrock bearer auth into Converse requests made by ``client``."""
+    if not bearer_token:
+        return
+
+    def _inject_bearer_header(params=None, **_kwargs):
+        if params is None:
+            return
+        headers = params.setdefault("headers", {})
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    events = getattr(getattr(client, "meta", None), "events", None)
+    register = getattr(events, "register", None)
+    if not callable(register):
+        logger.warning("bedrock: boto3 client has no event registry; bearer auth not attached")
+        return
+    register("before-call.bedrock-runtime.Converse", _inject_bearer_header)
+    register("before-call.bedrock-runtime.ConverseStream", _inject_bearer_header)
+
+
 def _get_bedrock_runtime_client(region: str):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    if region not in _bedrock_runtime_client_cache:
+    bearer_token = _bedrock_bearer_token()
+    cache_key = _runtime_client_cache_key(region, bearer_token)
+    if cache_key not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
-        )
-    return _bedrock_runtime_client_cache[region]
+        client_kwargs: Dict[str, Any] = {
+            "region_name": region,
+        }
+        if bearer_token:
+            from botocore import UNSIGNED
+            from botocore.config import Config
+
+            client_kwargs["config"] = Config(signature_version=UNSIGNED)
+        client = boto3.client("bedrock-runtime", **client_kwargs)
+        if bearer_token:
+            _register_bedrock_bearer_auth(client, bearer_token)
+        _bedrock_runtime_client_cache[cache_key] = client
+    return _bedrock_runtime_client_cache[cache_key]
 
 
 def _get_bedrock_control_client(region: str):
@@ -128,9 +185,13 @@ def invalidate_runtime_client(region: str) -> bool:
     Returns True if a cached entry was evicted, False if the region was not
     cached.
     """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
-    return existed
+    keys = [
+        key for key in _bedrock_runtime_client_cache
+        if _runtime_client_cache_key_region(key) == region
+    ]
+    for key in keys:
+        _bedrock_runtime_client_cache.pop(key, None)
+    return bool(keys)
 
 
 # ---------------------------------------------------------------------------

@@ -129,6 +129,7 @@ class GatewayKanbanWatchersMixin:
             return
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        DELIVERY_KINDS = ("completed", "blocked")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -230,13 +231,14 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
+                                is_delivery = (sub.get("delivery_mode") or "notify") == "agent"
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=DELIVERY_KINDS if is_delivery else TERMINAL_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -252,6 +254,7 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "is_delivery": is_delivery,
                                 })
                         finally:
                             conn.close()
@@ -259,6 +262,9 @@ class GatewayKanbanWatchersMixin:
 
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
+                    if d.get("is_delivery"):
+                        await self._handle_kanban_delivery(d)
+                        continue
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
@@ -498,6 +504,147 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    async def _handle_kanban_delivery(self, delivery: dict) -> None:
+        """Inject a kanban terminal event into the originating agent session."""
+        from gateway.config import Platform as _Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        sub = delivery["sub"]
+        task = delivery.get("task")
+        board_slug = delivery.get("board")
+        platform_str = (sub.get("platform") or "").lower()
+
+        try:
+            platform = _Platform(platform_str)
+        except ValueError:
+            await asyncio.to_thread(self._kanban_advance, sub, delivery["cursor"], board_slug)
+            await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+            return
+
+        adapter = self.adapters.get(platform)
+        if adapter is None:
+            logger.debug(
+                "kanban notifier: adapter %s disconnected before delivery injection for %s; rewinding claim",
+                platform_str, sub["task_id"],
+            )
+            await asyncio.to_thread(
+                self._kanban_rewind,
+                sub,
+                delivery["cursor"],
+                delivery.get("old_cursor", 0),
+                board_slug,
+            )
+            return
+
+        source = self._source_for_kanban_delivery(sub, platform)
+        if source is None:
+            logger.warning(
+                "kanban notifier: dropping delivery for %s; no source metadata",
+                sub.get("task_id"),
+            )
+            await asyncio.to_thread(self._kanban_advance, sub, delivery["cursor"], board_slug)
+            await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+            return
+
+        handle_message = getattr(adapter, "handle_message", None)
+        if not callable(handle_message):
+            logger.warning(
+                "kanban notifier: adapter %s cannot inject delivery for %s",
+                platform_str, sub.get("task_id"),
+            )
+            await asyncio.to_thread(
+                self._kanban_rewind,
+                sub,
+                delivery["cursor"],
+                delivery.get("old_cursor", 0),
+                board_slug,
+            )
+            return
+
+        for event in delivery["events"]:
+            text = self._kanban_delivery_text(sub, task, event)
+            if not text:
+                continue
+            try:
+                synthetic_event = MessageEvent(
+                    text=text,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                    message_id=getattr(source, "message_id", None),
+                )
+                await handle_message(synthetic_event)
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: delivery injection failed for %s: %s",
+                    sub.get("task_id"), exc,
+                )
+                await asyncio.to_thread(
+                    self._kanban_rewind,
+                    sub,
+                    delivery["cursor"],
+                    delivery.get("old_cursor", 0),
+                    board_slug,
+                )
+                return
+
+        await asyncio.to_thread(self._kanban_advance, sub, delivery["cursor"], board_slug)
+        await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+
+    def _source_for_kanban_delivery(self, sub: dict, platform) -> Optional[Any]:
+        from gateway.session import SessionSource
+
+        session_key = (sub.get("session_key") or "").strip()
+        store = getattr(self, "session_store", None)
+        if store is not None and session_key:
+            try:
+                ensure_loaded = getattr(store, "_ensure_loaded", None)
+                if callable(ensure_loaded):
+                    ensure_loaded()
+                entry = getattr(store, "_entries", {}).get(session_key)
+                if entry and entry.origin:
+                    return entry.origin
+            except Exception:
+                logger.debug("kanban notifier: session-store lookup failed", exc_info=True)
+
+        chat_id = str(sub.get("chat_id") or "").strip()
+        if not chat_id:
+            return None
+        thread_id = str(sub.get("thread_id") or "").strip() or None
+        return SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="thread" if thread_id else "dm",
+            user_id=sub.get("user_id") or "system:kanban-delivery",
+            user_name="Kanban",
+            thread_id=thread_id,
+        )
+
+    def _kanban_delivery_text(self, sub: dict, task, event) -> str:
+        title = (task.title if task else sub.get("task_id", ""))[:120]
+        task_id = sub.get("task_id", "")
+        if event.kind == "completed":
+            summary = ""
+            if event.payload and event.payload.get("summary"):
+                summary = str(event.payload["summary"]).strip()
+            elif task and task.result:
+                summary = str(task.result).strip()
+            summary = summary[:500] if summary else "(no summary provided)"
+            return (
+                f"[Kanban task {task_id} completed - {title}.\n"
+                f"Summary: {summary}]"
+            )
+        if event.kind == "blocked":
+            reason = ""
+            if event.payload and event.payload.get("reason"):
+                reason = str(event.payload["reason"]).strip()
+            reason = reason[:300] if reason else "(no reason given)"
+            return (
+                f"[Kanban task {task_id} blocked - {title}.\n"
+                f"Reason: {reason}]"
+            )
+        return ""
 
     async def _deliver_kanban_artifacts(
         self,

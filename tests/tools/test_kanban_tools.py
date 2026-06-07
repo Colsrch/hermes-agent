@@ -914,6 +914,62 @@ def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_delivery_registers_gateway_session_on_notify_sub(monkeypatch, worker_env):
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:chat-1:topic-1")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "topic-1")
+    monkeypatch.setenv("HERMES_PROFILE", "gateway-profile")
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "deliver back",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "delivery": True,
+    })
+    d = json.loads(out)
+
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    sub = subs[0]
+    assert sub["delivery_mode"] == "agent"
+    assert sub["session_key"] == "agent:main:telegram:dm:chat-1:topic-1"
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "chat-1"
+    assert sub["thread_id"] == "topic-1"
+    assert sub["notifier_profile"] == "gateway-profile"
+
+
+def test_create_delivery_rejects_missing_gateway_session(monkeypatch, worker_env):
+    for name in (
+        "HERMES_SESSION_KEY",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "missing delivery context",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "delivery": True,
+    })
+
+    assert "delivery requires gateway session context" in json.loads(out).get("error", "")
+
+
 def test_create_rejects_no_title(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"assignee": "x"})).get("error")

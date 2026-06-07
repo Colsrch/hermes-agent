@@ -161,6 +161,26 @@ class TestRuntimeProvider:
 
         assert result["region"] == "us-east-1"
 
+    def test_bedrock_bearer_token_forces_converse_even_for_claude(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+
+        with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
+             patch("hermes_cli.runtime_provider._get_model_config", return_value={
+                 "provider": "bedrock",
+                 "default": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+             }):
+            result = resolve_runtime_provider(requested="bedrock")
+
+        assert result["provider"] == "bedrock"
+        assert result["source"] == "AWS_BEARER_TOKEN_BEDROCK"
+        assert result["api_mode"] == "bedrock_converse"
+        assert "bedrock_anthropic" not in result
+
     def test_bedrock_runtime_no_credentials_raises_on_auto_detect(self, monkeypatch):
         """When bedrock is auto-detected (not explicitly requested) and no
         credentials are found, runtime resolution should raise AuthError."""
@@ -200,6 +220,48 @@ class TestRuntimeProvider:
             result = resolve_runtime_provider(requested="bedrock")
         assert result["provider"] == "bedrock"
         assert result["api_mode"] == "bedrock_converse"
+
+
+class TestAuxiliaryBedrock:
+    def test_bedrock_bearer_uses_native_converse_auxiliary_client(self, monkeypatch):
+        from agent.auxiliary_client import (
+            BedrockConverseAuxiliaryClient,
+            resolve_provider_client,
+        )
+
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+        with patch("hermes_cli.config.load_config", return_value={
+            "bedrock": {"region": "ap-southeast-2"},
+        }):
+            client, model = resolve_provider_client(
+                "bedrock",
+                model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            )
+
+        assert isinstance(client, BedrockConverseAuxiliaryClient)
+        assert client.region == "ap-southeast-2"
+        assert client.api_key == "bedrock-bearer"
+        assert model == "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+    def test_bedrock_bearer_auxiliary_client_supports_async_mode(self, monkeypatch):
+        from agent.auxiliary_client import (
+            AsyncBedrockConverseAuxiliaryClient,
+            resolve_provider_client,
+        )
+
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+        with patch("hermes_cli.config.load_config", return_value={
+            "bedrock": {"region": "eu-central-1"},
+        }):
+            client, model = resolve_provider_client(
+                "bedrock",
+                model="amazon.nova-pro-v1:0",
+                async_mode=True,
+            )
+
+        assert isinstance(client, AsyncBedrockConverseAuxiliaryClient)
+        assert client.region == "eu-central-1"
+        assert model == "amazon.nova-pro-v1:0"
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +569,10 @@ class TestBedrockModelIdDetection:
 
 class TestAuxiliaryClientBedrockResolution:
     """Verify resolve_provider_client handles Bedrock's aws_sdk auth type."""
+
+    @pytest.fixture(autouse=True)
+    def _without_bedrock_bearer_token(self, monkeypatch):
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
 
     def test_bedrock_returns_client_with_credentials(self, monkeypatch):
         """With valid AWS credentials, Bedrock should return a usable client."""

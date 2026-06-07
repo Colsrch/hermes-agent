@@ -1126,6 +1126,80 @@ class AsyncAnthropicAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+class _BedrockConverseCompletionsAdapter:
+    def __init__(self, region: str, model: str):
+        self._region = region
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        stop_sequences = kwargs.get("stop") or kwargs.get("stop_sequences")
+        if isinstance(stop_sequences, str):
+            stop_sequences = [stop_sequences]
+        from agent.bedrock_adapter import call_converse
+
+        return call_converse(
+            region=self._region,
+            model=kwargs.get("model") or self._model,
+            messages=kwargs.get("messages") or [],
+            tools=kwargs.get("tools"),
+            max_tokens=(
+                kwargs.get("max_tokens")
+                or kwargs.get("max_completion_tokens")
+                or 2000
+            ),
+            temperature=kwargs.get("temperature"),
+            top_p=kwargs.get("top_p"),
+            stop_sequences=stop_sequences,
+        )
+
+
+class _BedrockConverseChatShim:
+    def __init__(self, adapter: _BedrockConverseCompletionsAdapter):
+        self.completions = adapter
+
+
+class BedrockConverseAuxiliaryClient:
+    """OpenAI-client-compatible wrapper over Bedrock Converse."""
+
+    def __init__(self, region: str, model: str, api_key: str):
+        self.region = region
+        self.api_key = api_key
+        self.base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+        self.chat = _BedrockConverseChatShim(
+            _BedrockConverseCompletionsAdapter(region, model)
+        )
+        self._real_client = self
+
+    def close(self):
+        return None
+
+
+class _AsyncBedrockConverseCompletionsAdapter:
+    def __init__(self, sync_adapter: _BedrockConverseCompletionsAdapter):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncBedrockConverseChatShim:
+    def __init__(self, adapter: _AsyncBedrockConverseCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncBedrockConverseAuxiliaryClient:
+    def __init__(self, sync_wrapper: "BedrockConverseAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        self.chat = _AsyncBedrockConverseChatShim(
+            _AsyncBedrockConverseCompletionsAdapter(sync_adapter)
+        )
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+        self.region = sync_wrapper.region
+        self._real_client = sync_wrapper._real_client
+
+
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     """True if the endpoint at ``base_url`` speaks the Anthropic Messages
     protocol instead of OpenAI chat.completions.
@@ -1754,6 +1828,21 @@ def _read_main_provider() -> str:
     except Exception:
         pass
     return ""
+
+
+def _resolve_aux_bedrock_region() -> str:
+    """Resolve Bedrock region for auxiliary clients using runtime-provider priority."""
+    try:
+        from hermes_cli.config import load_config
+        bedrock_cfg = load_config().get("bedrock", {})
+        if isinstance(bedrock_cfg, dict):
+            configured = str(bedrock_cfg.get("region") or "").strip()
+            if configured:
+                return configured
+    except Exception:
+        pass
+    from agent.bedrock_adapter import resolve_bedrock_region
+    return resolve_bedrock_region()
 
 
 # Process-local override set by AIAgent at session/turn start. Single-threaded
@@ -3383,6 +3472,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, BedrockConverseAuxiliaryClient):
+        return AsyncBedrockConverseAuxiliaryClient(sync_client), model
     try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
@@ -4049,10 +4140,11 @@ def resolve_provider_client(
         return None, None
 
     elif pconfig.auth_type == "aws_sdk":
-        # AWS SDK providers (Bedrock) — use the Anthropic Bedrock client via
-        # boto3's credential chain (IAM roles, SSO, env vars, instance metadata).
+        # AWS SDK providers (Bedrock). IAM/profile sources use AnthropicBedrock
+        # for Claude feature parity; Bedrock bearer API keys must use native
+        # Converse because AnthropicBedrock cannot authenticate with that token.
         try:
-            from agent.bedrock_adapter import has_aws_credentials, resolve_bedrock_region
+            from agent.bedrock_adapter import has_aws_credentials, resolve_aws_auth_env_var
             from agent.anthropic_adapter import build_anthropic_bedrock_client
         except ImportError:
             logger.warning("resolve_provider_client: bedrock requested but "
@@ -4064,9 +4156,20 @@ def resolve_provider_client(
                          "no AWS credentials found")
             return None, None
 
-        region = resolve_bedrock_region()
+        region = _resolve_aux_bedrock_region()
         default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
         final_model = _normalize_resolved_model(model or default_model, provider)
+        auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
+        if auth_source == "AWS_BEARER_TOKEN_BEDROCK":
+            client = BedrockConverseAuxiliaryClient(
+                region=region,
+                model=final_model,
+                api_key="bedrock-bearer",
+            )
+            logger.debug("resolve_provider_client: bedrock bearer (%s, %s)",
+                         final_model, region)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         try:
             real_client = build_anthropic_bedrock_client(region)
         except ImportError as exc:

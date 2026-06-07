@@ -1130,6 +1130,8 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     notifier_profile TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'notify',
+    session_key   TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -1743,6 +1745,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "delivery_mode" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivery_mode",
+                "delivery_mode TEXT NOT NULL DEFAULT 'notify'",
+            )
+        if "session_key" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "session_key", "session_key TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -1866,7 +1879,8 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
+        " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
+        " session_key TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -7359,18 +7373,42 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    delivery_mode: str = "notify",
+    session_key: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
     now = int(time.time())
+    mode = (delivery_mode or "notify").strip().lower()
+    if mode not in {"notify", "agent"}:
+        raise ValueError(f"unknown kanban notification delivery_mode: {delivery_mode!r}")
+    normalized_session_key = (session_key or "").strip()
+    if mode == "agent" and not normalized_session_key:
+        raise ValueError("agent delivery subscriptions require session_key")
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id,
+                 notifier_profile, delivery_mode, session_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id, platform, chat_id, thread_id or "", user_id,
+                notifier_profile, mode, normalized_session_key, now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET delivery_mode = ?,
+                   session_key = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (
+                mode, normalized_session_key,
+                task_id, platform, chat_id, thread_id or "",
+            ),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
