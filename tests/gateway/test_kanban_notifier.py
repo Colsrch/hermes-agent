@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -10,9 +12,13 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -40,6 +46,7 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    runner.session_store = SimpleNamespace(_entries={})
     return runner
 
 
@@ -63,6 +70,22 @@ def _unseen_terminal_events(tid):
             platform="telegram",
             chat_id="chat-1",
             kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
+        )
+        return events
+    finally:
+        conn.close()
+
+
+def _unseen_delivery_events(tid):
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            kinds=["completed", "blocked"],
         )
         return events
     finally:
@@ -171,6 +194,113 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+@pytest.mark.parametrize(
+    ("event_kind", "event_text", "expected_detail"),
+    [
+        ("completed", "finished the work", "finished the work"),
+        ("blocked", "waiting on input", "waiting on input"),
+    ],
+)
+def test_kanban_delivery_injects_synthetic_message_and_removes_sub(
+    tmp_path,
+    monkeypatch,
+    event_kind,
+    event_text,
+    expected_detail,
+):
+    db_path = tmp_path / f"delivery-{event_kind}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="deliver task", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            delivery_mode="agent",
+            session_key="agent:main:telegram:dm:chat-1:topic-1",
+        )
+        if event_kind == "completed":
+            kb.complete_task(conn, tid, summary=event_text)
+        else:
+            kb.block_task(conn, tid, reason=event_text)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.internal is True
+    assert event.source.chat_id == "chat-1"
+    assert event.source.thread_id == "topic-1"
+    assert tid in event.text
+    assert expected_detail in event.text
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+class FailingHandleAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.handle_attempts = 0
+
+    async def handle_message(self, event):
+        self.handle_attempts += 1
+        raise RuntimeError("simulated delivery injection failure")
+
+
+def test_kanban_delivery_rewinds_claim_on_handle_exception(tmp_path, monkeypatch):
+    db_path = tmp_path / "delivery-handle-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="delivery retry", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            delivery_mode="agent",
+            session_key="agent:main:telegram:dm:chat-1:topic-1",
+        )
+        kb.complete_task(conn, tid, summary="retry later")
+    finally:
+        conn.close()
+
+    adapter = FailingHandleAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handle_attempts == 1
+    assert [ev.kind for ev in _unseen_delivery_events(tid)] == ["completed"]
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "agent"
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
