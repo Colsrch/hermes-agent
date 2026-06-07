@@ -765,20 +765,36 @@ def _handle_create(args: dict, **kw) -> str:
     if delivery:
         from gateway.session_context import get_session_env
 
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
         delivery_context = {
-            "session_key": get_session_env("HERMES_SESSION_KEY", ""),
-            "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
-            "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
-            "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+            "session_key": session_key,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
         }
+        if not (session_key and platform and chat_id):
+            delivery_platform = get_session_env("HERMES_SESSION_DELIVERY_PLATFORM", "")
+            delivery_chat_id = get_session_env("HERMES_SESSION_DELIVERY_CHAT_ID", "")
+            delivery_thread_id = get_session_env("HERMES_SESSION_DELIVERY_THREAD_ID", "")
+            delivery_context = {
+                "session_key": session_key,
+                "platform": delivery_platform,
+                "chat_id": delivery_chat_id,
+                "thread_id": delivery_thread_id,
+            }
         if not (
             delivery_context["session_key"]
             and delivery_context["platform"]
             and delivery_context["chat_id"]
         ):
             return tool_error(
-                "delivery requires gateway session context "
-                "(HERMES_SESSION_KEY, HERMES_SESSION_PLATFORM, HERMES_SESSION_CHAT_ID)"
+                "delivery requires gateway or TUI session context "
+                "(HERMES_SESSION_KEY plus either "
+                "HERMES_SESSION_PLATFORM/HERMES_SESSION_CHAT_ID or "
+                "HERMES_SESSION_DELIVERY_PLATFORM/HERMES_SESSION_DELIVERY_CHAT_ID)"
             )
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
