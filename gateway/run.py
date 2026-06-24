@@ -5714,6 +5714,11 @@ class GatewayRunner:
 
     def _source_for_kanban_delivery(self, sub: dict, platform) -> Optional[SessionSource]:
         session_key = (sub.get("session_key") or "").strip()
+        if session_key:
+            cached_source = self._get_cached_session_source(session_key)
+            if cached_source is not None:
+                return cached_source
+
         store = getattr(self, "session_store", None)
         if store is not None and session_key:
             try:
