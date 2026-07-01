@@ -6380,7 +6380,16 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 
 _TUI_KANBAN_DELIVERY_PLATFORM = "tui"
-_TUI_KANBAN_DELIVERY_KINDS = ("completed", "blocked")
+_TUI_KANBAN_DELIVERY_KINDS = (
+    "completed",
+    "blocked",
+    "gave_up",
+    "crashed",
+    "timed_out",
+    "spawn_failed",
+    "protocol_violation",
+    "rate_limited",
+)
 
 try:
     _TUI_KANBAN_DELIVERY_POLL_INTERVAL_S = max(
@@ -6420,6 +6429,61 @@ def _tui_kanban_delivery_text(sub: dict, task, event) -> str:
         return (
             f"[Kanban task {task_id} blocked - {title}.\n"
             f"Reason: {reason}]"
+        )
+    if event.kind == "timed_out":
+        limit = event.payload.get("limit_seconds") if event.payload else None
+        elapsed = event.payload.get("elapsed_seconds") if event.payload else None
+        return (
+            f"[Kanban task {task_id} timed out - {title}.\n"
+            f"Limit: {limit if limit is not None else 'unknown'}s\n"
+            f"Elapsed: {elapsed if elapsed is not None else 'unknown'}s]"
+        )
+    if event.kind == "gave_up":
+        error = ""
+        if event.payload and event.payload.get("error"):
+            error = str(event.payload["error"]).strip()
+        error = error[:500] if error else "(no error provided)"
+        return (
+            f"[Kanban task {task_id} gave up - {title}.\n"
+            f"Error: {error}]"
+        )
+    if event.kind == "crashed":
+        pid = event.payload.get("pid") if event.payload else None
+        detail = f"PID: {pid}" if pid is not None else "PID: unknown"
+        return (
+            f"[Kanban task {task_id} crashed - {title}.\n"
+            f"{detail}]"
+        )
+    if event.kind == "spawn_failed":
+        error = ""
+        if event.payload and event.payload.get("error"):
+            error = str(event.payload["error"]).strip()
+        error = error[:500] if error else "(no error provided)"
+        return (
+            f"[Kanban task {task_id} spawn failed - {title}.\n"
+            f"Error: {error}]"
+        )
+    if event.kind == "protocol_violation":
+        exit_code = event.payload.get("exit_code") if event.payload else None
+        detail = (
+            f"Exit code: {exit_code}"
+            if exit_code is not None
+            else "Worker exited without completing or blocking."
+        )
+        return (
+            f"[Kanban task {task_id} protocol violation - {title}.\n"
+            f"{detail}]"
+        )
+    if event.kind == "rate_limited":
+        exit_code = event.payload.get("exit_code") if event.payload else None
+        detail = (
+            f"Exit code: {exit_code}"
+            if exit_code is not None
+            else "Provider quota or rate limit encountered."
+        )
+        return (
+            f"[Kanban task {task_id} rate limited - {title}.\n"
+            f"{detail}]"
         )
     return ""
 

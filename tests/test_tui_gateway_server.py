@@ -7287,6 +7287,74 @@ def test_tui_kanban_delivery_poller_keeps_sub_after_blocked_until_completed(
         server._sessions.pop("sid_kanban_blocked", None)
 
 
+def test_tui_kanban_delivery_poller_delivers_task_exception_events(
+    monkeypatch,
+    tmp_path,
+):
+    kb = _init_tui_kanban_delivery_db(monkeypatch, tmp_path)
+    delivery_key = "exception-delivery-key"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="desktop exception delivery", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id=delivery_key,
+            delivery_mode="agent",
+            session_key="old-compressed-session-key",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            kind="timed_out",
+            payload={"limit_seconds": 60, "elapsed_seconds": 90},
+        )
+        kb._append_event(
+            conn,
+            tid,
+            kind="gave_up",
+            payload={"error": "elapsed 60s > limit 0s"},
+        )
+    finally:
+        conn.close()
+
+    turns = []
+
+    def _fake_run_prompt_submit(_rid, _sid, session, text):
+        turns.append(text)
+        with session["history_lock"]:
+            session["running"] = False
+
+    sess = _session(session_key="new-compressed-session-key", delivery_key=delivery_key)
+    server._sessions["sid_kanban_exception"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _fake_run_prompt_submit)
+
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._tui_kanban_delivery_poller_loop(stop, "sid_kanban_exception", sess)
+
+        assert len(turns) == 1
+        assert f"[Kanban task {tid} timed out - desktop exception delivery." in turns[0]
+        assert "Limit: 60s" in turns[0]
+        assert f"[Kanban task {tid} gave up - desktop exception delivery." in turns[0]
+        assert "elapsed 60s > limit 0s" in turns[0]
+
+        conn = kb.connect()
+        try:
+            subs = kb.list_notify_subs(conn, tid)
+            assert len(subs) == 1
+            assert subs[0]["last_event_id"] > 0
+        finally:
+            conn.close()
+    finally:
+        server._sessions.pop("sid_kanban_exception", None)
+
+
 def test_tui_kanban_delivery_poller_rewinds_when_session_busy(monkeypatch, tmp_path):
     kb = _init_tui_kanban_delivery_db(monkeypatch, tmp_path)
     delivery_key = "busy-delivery-key"

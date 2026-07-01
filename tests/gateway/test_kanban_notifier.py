@@ -3,6 +3,8 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -308,6 +310,67 @@ def test_kanban_delivery_keeps_sub_after_blocked_until_completed(
         assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    ("event_kind", "payload", "expected_text"),
+    [
+        ("timed_out", {"limit_seconds": 60, "elapsed_seconds": 90}, "timed out"),
+        ("gave_up", {"error": "elapsed 60s > limit 0s"}, "gave up"),
+        ("crashed", {"pid": 1234}, "crashed"),
+        ("spawn_failed", {"error": "spawn failed"}, "spawn failed"),
+        ("protocol_violation", {"exit_code": 0}, "protocol violation"),
+        ("rate_limited", {"exit_code": 75}, "rate limited"),
+    ],
+)
+def test_kanban_delivery_injects_task_exception_events(
+    tmp_path,
+    monkeypatch,
+    event_kind,
+    payload,
+    expected_text,
+):
+    db_path = tmp_path / f"delivery-{event_kind}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="deliver exception", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            delivery_mode="agent",
+            session_key="agent:main:telegram:dm:chat-1:topic-1",
+        )
+        kb._append_event(conn, tid, kind=event_kind, payload=payload)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.internal is True
+    assert event.source.chat_id == "chat-1"
+    assert event.source.thread_id == "topic-1"
+    assert tid in event.text
+    assert expected_text in event.text.lower()
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "agent"
 
 
 class FailingHandleAdapter(RecordingAdapter):

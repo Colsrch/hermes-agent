@@ -1391,7 +1391,8 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "When true from a gateway-hosted agent session, inject "
                     "a synthetic message back into this same session when "
-                    "the task completes or blocks."
+                    "the task completes, blocks, or hits an exception such "
+                    "as timeout/crash/gave-up."
                 ),
             },
             "idempotency_key": {
