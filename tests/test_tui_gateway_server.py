@@ -7215,6 +7215,78 @@ def test_tui_kanban_delivery_poller_delivers_completed_task(monkeypatch, tmp_pat
         server._sessions.pop("sid_kanban", None)
 
 
+def test_tui_kanban_delivery_poller_keeps_sub_after_blocked_until_completed(
+    monkeypatch,
+    tmp_path,
+):
+    kb = _init_tui_kanban_delivery_db(monkeypatch, tmp_path)
+    delivery_key = "blocked-delivery-key"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="desktop blocked delivery", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id=delivery_key,
+            delivery_mode="agent",
+            session_key="old-compressed-session-key",
+        )
+        kb.block_task(conn, tid, reason="waiting on review")
+    finally:
+        conn.close()
+
+    turns = []
+    emitted = []
+
+    def _fake_run_prompt_submit(_rid, _sid, session, text):
+        turns.append(text)
+        with session["history_lock"]:
+            session["running"] = False
+
+    sess = _session(session_key="new-compressed-session-key", delivery_key=delivery_key)
+    server._sessions["sid_kanban_blocked"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
+    monkeypatch.setattr(server, "_run_prompt_submit", _fake_run_prompt_submit)
+
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._tui_kanban_delivery_poller_loop(stop, "sid_kanban_blocked", sess)
+
+        assert len(turns) == 1
+        assert f"[Kanban task {tid} blocked - desktop blocked delivery." in turns[0]
+        assert "Reason: waiting on review" in turns[0]
+        assert any(a[0] == "status.update" and a[2]["kind"] == "kanban" for a in emitted)
+
+        conn = kb.connect()
+        try:
+            subs = kb.list_notify_subs(conn, tid)
+            assert len(subs) == 1
+            assert subs[0]["delivery_mode"] == "agent"
+            assert subs[0]["last_event_id"] > 0
+            kb.unblock_task(conn, tid)
+            kb.complete_task(conn, tid, summary="desktop final summary")
+        finally:
+            conn.close()
+
+        server._tui_kanban_delivery_poller_loop(stop, "sid_kanban_blocked", sess)
+
+        assert len(turns) == 2
+        assert f"[Kanban task {tid} completed - desktop blocked delivery." in turns[1]
+        assert "Summary: desktop final summary" in turns[1]
+
+        conn = kb.connect()
+        try:
+            assert kb.list_notify_subs(conn, tid) == []
+        finally:
+            conn.close()
+    finally:
+        server._sessions.pop("sid_kanban_blocked", None)
+
+
 def test_tui_kanban_delivery_poller_rewinds_when_session_busy(monkeypatch, tmp_path):
     kb = _init_tui_kanban_delivery_db(monkeypatch, tmp_path)
     delivery_key = "busy-delivery-key"

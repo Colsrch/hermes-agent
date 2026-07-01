@@ -2,8 +2,6 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
@@ -196,21 +194,11 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
 
 
-@pytest.mark.parametrize(
-    ("event_kind", "event_text", "expected_detail"),
-    [
-        ("completed", "finished the work", "finished the work"),
-        ("blocked", "waiting on input", "waiting on input"),
-    ],
-)
-def test_kanban_delivery_injects_synthetic_message_and_removes_sub(
+def test_kanban_delivery_completed_injects_synthetic_message_and_removes_sub(
     tmp_path,
     monkeypatch,
-    event_kind,
-    event_text,
-    expected_detail,
 ):
-    db_path = tmp_path / f"delivery-{event_kind}.db"
+    db_path = tmp_path / "delivery-completed.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
@@ -226,10 +214,7 @@ def test_kanban_delivery_injects_synthetic_message_and_removes_sub(
             delivery_mode="agent",
             session_key="agent:main:telegram:dm:chat-1:topic-1",
         )
-        if event_kind == "completed":
-            kb.complete_task(conn, tid, summary=event_text)
-        else:
-            kb.block_task(conn, tid, reason=event_text)
+        kb.complete_task(conn, tid, summary="finished the work")
     finally:
         conn.close()
 
@@ -245,7 +230,76 @@ def test_kanban_delivery_injects_synthetic_message_and_removes_sub(
     assert event.source.chat_id == "chat-1"
     assert event.source.thread_id == "topic-1"
     assert tid in event.text
-    assert expected_detail in event.text
+    assert "finished the work" in event.text
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def test_kanban_delivery_keeps_sub_after_blocked_until_completed(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "delivery-block-complete.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="deliver blocked task", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            delivery_mode="agent",
+            session_key="agent:main:telegram:dm:chat-1:topic-1",
+        )
+        kb.block_task(conn, tid, reason="waiting on review")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    blocked_event = adapter.handled[0]
+    assert blocked_event.internal is True
+    assert blocked_event.source.chat_id == "chat-1"
+    assert blocked_event.source.thread_id == "topic-1"
+    assert tid in blocked_event.text
+    assert "blocked" in blocked_event.text
+    assert "waiting on review" in blocked_event.text
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["delivery_mode"] == "agent"
+        assert subs[0]["last_event_id"] > 0
+        kb.unblock_task(conn, tid)
+        kb.complete_task(conn, tid, summary="final summary")
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.handled) == 2
+    completed_event = adapter.handled[1]
+    assert completed_event.internal is True
+    assert completed_event.source.chat_id == "chat-1"
+    assert completed_event.source.thread_id == "topic-1"
+    assert tid in completed_event.text
+    assert "completed" in completed_event.text
+    assert "final summary" in completed_event.text
 
     conn = kb.connect()
     try:

@@ -6424,6 +6424,16 @@ def _tui_kanban_delivery_text(sub: dict, task, event) -> str:
     return ""
 
 
+def _tui_kanban_delivery_should_unsub(delivery: dict) -> bool:
+    task = delivery.get("task")
+    if task and task.status in {"done", "archived"}:
+        return True
+    return any(
+        getattr(event, "kind", None) == "completed"
+        for event in delivery.get("events") or ()
+    )
+
+
 def _tui_kanban_connect(board: str | None = None):
     from hermes_cli import kanban_db as _kb
 
@@ -6608,7 +6618,8 @@ def _poll_tui_kanban_deliveries_once(sid: str, session: dict) -> None:
                 continue
 
             _tui_kanban_advance(sub, delivery["cursor"], board)
-            _tui_kanban_unsub(sub, board)
+            if _tui_kanban_delivery_should_unsub(delivery):
+                _tui_kanban_unsub(sub, board)
     finally:
         if home_token is not None:
             reset_hermes_home_override(home_token)

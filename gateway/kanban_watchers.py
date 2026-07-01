@@ -590,7 +590,18 @@ class GatewayKanbanWatchersMixin:
                 return
 
         await asyncio.to_thread(self._kanban_advance, sub, delivery["cursor"], board_slug)
-        await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+        if self._kanban_delivery_should_unsub(delivery):
+            await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+
+    @staticmethod
+    def _kanban_delivery_should_unsub(delivery: dict) -> bool:
+        task = delivery.get("task")
+        if task and task.status in {"done", "archived"}:
+            return True
+        return any(
+            getattr(event, "kind", None) == "completed"
+            for event in delivery.get("events") or ()
+        )
 
     def _source_for_kanban_delivery(self, sub: dict, platform) -> Optional[Any]:
         from gateway.session import SessionSource
