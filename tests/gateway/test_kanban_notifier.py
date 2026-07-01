@@ -1,9 +1,11 @@
 import asyncio
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
 
 
@@ -355,6 +357,59 @@ def test_kanban_delivery_rewinds_claim_on_handle_exception(tmp_path, monkeypatch
         conn.close()
     assert len(subs) == 1
     assert subs[0]["delivery_mode"] == "agent"
+
+
+def test_kanban_delivery_prefers_cached_live_source_over_stale_session_origin():
+    session_key = "agent:main:feishu:group:oc_chat:omt_topic"
+    stale_source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        user_id="u1",
+        user_name="Alice",
+        thread_id="omt_topic",
+    )
+    live_source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        user_id="u1",
+        user_name="Alice",
+        thread_id="omt_topic",
+        message_id="om_trigger",
+    )
+
+    adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {Platform.FEISHU: adapter}
+    runner.session_store = SimpleNamespace(
+        _entries={session_key: SimpleNamespace(origin=stale_source)}
+    )
+    runner._session_sources = OrderedDict([(session_key, live_source)])
+    runner._kanban_advance = lambda *args, **kwargs: None
+    runner._kanban_unsub = lambda *args, **kwargs: None
+
+    delivery = {
+        "sub": {
+            "task_id": "K-1",
+            "platform": "feishu",
+            "chat_id": "oc_chat",
+            "thread_id": "omt_topic",
+            "session_key": session_key,
+        },
+        "events": [
+            SimpleNamespace(kind="completed", payload={"summary": "done"})
+        ],
+        "cursor": 1,
+        "old_cursor": 0,
+    }
+
+    asyncio.run(runner._handle_kanban_delivery(delivery))
+
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.source.message_id == "om_trigger"
+    assert event.message_id == "om_trigger"
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):

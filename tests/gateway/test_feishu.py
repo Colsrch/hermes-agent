@@ -1616,6 +1616,48 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.source.chat_name, "Feishu DM")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_topic_message_preserves_thread_and_trigger_message_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="张三")
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu Topic Group", "type": "group"}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id="omt_topic",
+            root_id="om_root",
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"deliver this through kanban"}',
+            message_id="om_trigger",
+        )
+        sender_id = SimpleNamespace(
+            open_id="ou_user",
+            user_id="u_user",
+            union_id="on_union",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=sender_id,
+                chat_type="group",
+                message_id="om_trigger",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.thread_id, "omt_topic")
+        self.assertEqual(event.source.message_id, "om_trigger")
+        self.assertEqual(event.reply_to_message_id, "om_root")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_text_batch_merges_rapid_messages_into_single_event(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.base import MessageEvent, MessageType
