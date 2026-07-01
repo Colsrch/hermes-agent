@@ -868,7 +868,7 @@ def _handle_create(args: dict, **kw) -> str:
                     session_key=delivery_context["session_key"],
                 )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = True if delivery else _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,

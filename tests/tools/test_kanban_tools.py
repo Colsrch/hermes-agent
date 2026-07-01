@@ -14,6 +14,18 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_session_contextvars():
+    """Keep tests independent from other modules that clear session ContextVars."""
+    from gateway import session_context as sc
+
+    for var in set(sc._VAR_MAP.values()):
+        var.set(sc._UNSET)
+    yield
+    for var in set(sc._VAR_MAP.values()):
+        var.set(sc._UNSET)
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
